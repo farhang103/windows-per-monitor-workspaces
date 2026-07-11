@@ -25,7 +25,7 @@ jobs:
     name: Windows PowerShell 5.1
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run installer test matrix
         shell: powershell
         run: ./tests/Test-Installer.ps1
@@ -34,7 +34,7 @@ jobs:
     name: PowerShell 7
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Run installer test matrix
         shell: pwsh
         run: ./tests/Test-Installer.ps1
