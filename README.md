@@ -1,5 +1,11 @@
 # Independent Monitor Workspaces
 
+<p align="center">
+  <a href="assets/demo.mp4">
+    <img src="assets/demo.gif" alt="Independent per-monitor workspace switching demo" width="100%">
+  </a>
+</p>
+
 Independent, fast workspace switching for each monitor on Windows 11.
 
 Windows virtual desktops switch every display together. This lightweight AutoHotkey v2 utility gives each monitor its own workspace state: point at a screen, switch, and only the windows on that screen change. Other monitors stay exactly where they are.
