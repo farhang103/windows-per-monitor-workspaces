@@ -50,11 +50,12 @@ Point the mouse at the monitor you want to control, then use:
 | Shortcut | Action |
 |---|---|
 | `Win+Ctrl+Left` / `Win+Ctrl+Right` | Previous / next workspace on that monitor |
-| `Win+Ctrl+1` ... `Win+Ctrl+4` | Open a numbered workspace on that monitor |
-| `Win+Ctrl+Shift+1` ... `Win+Ctrl+Shift+4` | Move the active window to a workspace |
+| `Ctrl+Alt+Left` / `Ctrl+Alt+Right` | Logitech-friendly previous / next workspace shortcuts |
+| `Win+Ctrl+1` ... `Win+Ctrl+2` | Open a numbered workspace on that monitor |
+| `Win+Ctrl+Shift+1` ... `Win+Ctrl+Shift+2` | Move the active window to a workspace |
 | `Win+Ctrl+Shift+Esc` | Reveal every window and reset all workspace state |
 
-Four workspaces are enabled by default. Change `WORKSPACE_COUNT := 4` near the top of the script to any value from 1 to 9.
+Two workspaces are enabled by default. Change `WORKSPACE_COUNT := 2` near the top of the script to any value from 1 to 9.
 
 ## Uninstall in one command
 

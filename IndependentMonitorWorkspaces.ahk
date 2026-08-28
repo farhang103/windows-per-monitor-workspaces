@@ -7,7 +7,7 @@ Persistent
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
 APP_VERSION := "1.0.0"
-WORKSPACE_COUNT := 4
+WORKSPACE_COUNT := 2
 SHOW_FEEDBACK := true
 ANIMATION_MS := 180
 
@@ -33,6 +33,8 @@ Loop 9 {
 
 Hotkey("#^Left", PreviousWorkspace)
 Hotkey("#^Right", NextWorkspace)
+Hotkey("^!Left", PreviousWorkspace)
+Hotkey("^!Right", NextWorkspace)
 Hotkey("#^+Esc", ResetAndRevealAll)
 
 A_TrayMenu.Delete()
