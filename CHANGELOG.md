@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.2.7 - 2026-09-01
+
+- Replaced timer-only taskbar detection with a native Windows foreground-event hook
+- Re-hid externally activated workspace windows immediately, before DWM presents them on the wrong workspace
+- Prevented the premature app frame from entering the outgoing workspace capture
+- Retained a faster polling fallback and deduplicated event/poll activation handling
+
+## 1.2.6 - 2026-09-01
+
+- Detected taskbar and other external foreground activation of apps assigned to an inactive workspace
+- Converted an external app reveal into a real workspace transition, including the D-number indicator and persisted current-workspace state
+- Promoted and refocused the exact selected app after its workspace finishes switching
+- Added a taskbar-activation regression preview covering a D3-to-D1 Codex selection
+
+## 1.2.5 - 2026-09-01
+
+- Kept the completed animation frame visible until every incoming application acknowledges its show request
+- Preserved and restored each workspace's complete window Z-order so repeated switches do not change which overlapping or maximized app is on top
+- Persisted workspace window stacks across app restarts and installer updates
+- Added handoff acknowledgement, retry, and stack diagnostics plus an eight-switch regression loop
+
+## 1.2.4 - 2026-09-01
+
+- Isolated visual regression preview modes from persistent user workspace state
+- Excluded Windows XAML host and Raycast launcher/shutdown helper surfaces from workspace assignment
+
+## 1.2.3 - 2026-09-01
+
+- Accepted workspace hotkeys during an active animation instead of rejecting them
+- Coalesced repeated input to the latest requested workspace and calculated Left/Right from that requested state
+- Accelerated an in-progress slide to its final frame when another request arrives on the same monitor
+- Added a shorter 190 ms transition for queued rapid-switch destinations
+- Added automated interrupted-animation testing and queue/acceleration diagnostics
+
+## 1.2.2 - 2026-09-01
+
+- Replaced moving full-resolution Picture controls with a single custom-rendered animation surface
+- Added a persistent 1:1-pixel GDI back buffer and one-operation frame presentation to eliminate child-control erase and rescale flicker
+- Synchronized animation presentation with Desktop Window Manager and suppressed background erase messages
+- Added aggregate rendering diagnostics for physical resolution, DPI, capture/preparation time, frame count, average/max frame interval, render time, and slow frames
+
+## 1.2.1 - 2026-09-01
+
+- Replaced transparent per-window animation controls with two opaque, monitor-sized workspace frames
+- Locked the outgoing and incoming frame edges to the same pixel throughout the slide, eliminating background gaps caused by independent rounding
+- Reduced repaint work to two full-frame controls and disabled background erase during animation redraws
+- Cached complete workspace frames and invalidated them when window assignments change
+
 ## 1.2.0 - 2026-09-01
 
 - Added a 340 ms directional workspace slide using captured window surfaces, with cubic ease-in-out motion

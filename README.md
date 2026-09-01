@@ -59,7 +59,13 @@ Point the mouse at the monitor you want to control, then use:
 
 Three workspaces are enabled by default. Change `WORKSPACE_COUNT := 3` near the top of the script to any value from 1 to 9.
 
-Workspace changes use a 340 ms directional slide with no crossfade. Moving to a higher D-number slides the current windows left and brings the next workspace in from the right; moving to a lower D-number reverses that motion. The animation uses captured window surfaces so real application positions and maximized state remain unchanged.
+Workspace changes use a 340 ms directional slide with no crossfade. Moving to a higher D-number slides the current workspace left and brings the next one in from the right; moving to a lower D-number reverses that motion. Two opaque, monitor-sized workspace frames are composed at the monitor's physical resolution in a persistent off-screen buffer and presented as one Desktop Window Manager-synchronized surface. Their edges remain pixel-locked, preventing wallpaper gaps, erase flicker, or DPI rescaling while real application positions and maximized state remain unchanged.
+
+The completed animation frame stays in place until every incoming app is visible. Each workspace also remembers its full top-to-bottom window stack, so returning to a workspace restores all of its apps with the same overlapping or maximized app on top instead of whichever app responds first.
+
+You can press the switching shortcuts repeatedly without waiting for an animation to finish. Additional input completes the active visual frame immediately, coalesces to the latest requested D-number, and uses a shorter 190 ms slide for the queued destination.
+
+Clicking an app on the Windows taskbar also follows its workspace assignment. A native Windows foreground-event hook intercepts an app belonging to another D-number before its premature frame is presented on the current workspace. The utility then performs the real workspace switch, displays the correct D indicator, and focuses the selected app. The next previous/next shortcut therefore continues from that workspace instead of jumping back to it.
 
 ## Workspace overview
 
@@ -75,7 +81,7 @@ Preview capture is best effort. Protected, elevated, or specialized application 
 
 The app records workspace switching diagnostics in `%LOCALAPPDATA%\IndependentMonitorWorkspaces\debug.log`. Right-click its tray icon and select **Open debug log** to inspect or share it. The log includes window titles and process names so workspace assignments and focus failures can be identified. It rotates to `debug.previous.log` at 4 MB.
 
-Workspace assignments and each monitor's active D-number are saved in `%LOCALAPPDATA%\IndependentMonitorWorkspacesState\workspace-state.tsv`. This state survives app updates and restarts; stale windows are rejected by matching both their window handle and process ID.
+Workspace assignments, each monitor's active D-number, and each workspace's window stack are saved in `%LOCALAPPDATA%\IndependentMonitorWorkspacesState\workspace-state.tsv`. This state survives app updates and restarts; stale windows are rejected by matching both their window handle and process ID.
 
 ## Uninstall in one command
 
