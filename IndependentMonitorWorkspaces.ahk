@@ -6,24 +6,71 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.0.0"
-WORKSPACE_COUNT := 2
+APP_VERSION := "1.2.0"
+WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
-ANIMATION_MS := 180
+WORKSPACE_SLIDE_MS := 340
+INDICATOR_MS := 850
 
 global CurrentWorkspace := Map()
 global WindowWorkspace := Map()
 global HiddenByScript := Map()
+global WindowSnapshots := Map()
 global WorkspaceOverlays := Map()
+global WorkspaceOverview := false
+global OverviewHotCornerMonitor := 0
+global OverviewHotCornerEnteredAt := 0
+global OverviewHotCornerCooldownUntil := 0
+global OverviewPreviewWindows := []
+global OverviewPreviewMode := false
 global Switching := false
+global DEBUG_LOG_PATH := EnvGet("LOCALAPPDATA") "\IndependentMonitorWorkspaces\debug.log"
+global DEBUG_PREVIOUS_LOG_PATH := EnvGet("LOCALAPPDATA") "\IndependentMonitorWorkspaces\debug.previous.log"
+global DEBUG_MAX_BYTES := 4 * 1024 * 1024
+global DEBUG_SESSION_ID := FormatTime(, "yyyyMMdd-HHmmss") "-" DllCall("GetCurrentProcessId", "uint")
+global WORKSPACE_STATE_PATH := EnvGet("LOCALAPPDATA")
+    . "\IndependentMonitorWorkspacesState\workspace-state.tsv"
 
 DetectHiddenWindows true
 SetTitleMatchMode 2
 SetWinDelay -1
+OnMessage(0x000F, PaintWorkspaceOverview) ; WM_PAINT
+OnMessage(0x0202, HandleOverviewClick) ; WM_LBUTTONUP
+
+InitializeDebugLogging()
+DebugLog("STARTUP", "version=" APP_VERSION " script=" A_ScriptFullPath
+    " args=" FormatDebugArguments())
+
+if A_Args.Length && A_Args[1] = "--preview" {
+    previewMonitor := A_Args.Length >= 2 ? Integer(A_Args[2]) : MonitorGetPrimary()
+    previewWorkspace := A_Args.Length >= 3 ? Integer(A_Args[3]) : 2
+    previewDirection := A_Args.Length >= 4 ? Integer(A_Args[4]) : 1
+    ShowWorkspaceOverlay(previewMonitor, previewWorkspace, previewDirection)
+    SetTimer((*) => ExitApp(), -3000)
+    return
+}
+
+if A_Args.Length && A_Args[1] = "--overview-preview" {
+    InitializeMonitors()
+    previewMonitor := A_Args.Length >= 2 ? Integer(A_Args[2]) : MonitorGetPrimary()
+    SetupWorkspaceOverviewPreview(previewMonitor)
+    return
+}
+
+if A_Args.Length && A_Args[1] = "--slide-preview" {
+    InitializeMonitors()
+    previewMonitor := A_Args.Length >= 2 ? Integer(A_Args[2]) : MonitorGetPrimary()
+    SetupWorkspaceSlidePreview(previewMonitor)
+    return
+}
 
 InitializeMonitors()
-OnExit(RestoreAllWindows)
+OnExit(HandleAppExit)
 OnMessage(0x007E, HandleDisplayChange) ; WM_DISPLAYCHANGE
+LoadWorkspaceState()
+LearnVisibleWindows()
+ApplyRestoredWorkspaceVisibility()
+SaveWorkspaceState()
 
 Loop 9 {
     workspace := A_Index
@@ -36,9 +83,13 @@ Hotkey("#^Right", NextWorkspace)
 Hotkey("^!Left", PreviousWorkspace)
 Hotkey("^!Right", NextWorkspace)
 Hotkey("#^+Esc", ResetAndRevealAll)
+Hotkey("#^Space", ToggleWorkspaceOverview)
+SetTimer(CheckWorkspaceOverviewHotCorner, 100)
 
 A_TrayMenu.Delete()
+A_TrayMenu.Add("Workspace overview", ToggleWorkspaceOverview)
 A_TrayMenu.Add("Show shortcuts", ShowHelp)
+A_TrayMenu.Add("Open debug log", OpenDebugLog)
 A_TrayMenu.Add("Reveal all windows and reset", ResetAndRevealAll)
 A_TrayMenu.Add()
 A_TrayMenu.Add("Exit (reveals hidden windows)", (*) => ExitApp())
@@ -49,40 +100,77 @@ ShowFeedbackForMonitor(GetMonitorUnderMouse(), 1, "Ready")
 
 InitializeMonitors() {
     global CurrentWorkspace
-    Loop MonitorGetCount()
+    monitorCount := MonitorGetCount()
+    DebugLog("MONITORS_INIT", "count=" monitorCount " primary=" MonitorGetPrimary())
+    Loop monitorCount {
         CurrentWorkspace[A_Index] := 1
+        MonitorGet(A_Index, &left, &top, &right, &bottom)
+        DebugLog("MONITOR", "index=" A_Index " name=" MonitorGetName(A_Index)
+            " bounds=" left "," top "," right "," bottom
+            " dpi=" GetMonitorDpi(A_Index) " current=D1")
+    }
 }
 
 SwitchToWorkspace(workspace, direction := 0, *) {
+    if Type(direction) != "Integer"
+        direction := 0
+    EnsureMonitorState()
+    monitor := GetMonitorUnderMouse()
+    DebugLog("SWITCH_HOTKEY", "target=D" workspace " monitor=" monitor
+        " direction=" direction)
+    SwitchToWorkspaceOnMonitor(workspace, monitor, direction)
+}
+
+SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0) {
     global WORKSPACE_COUNT, CurrentWorkspace, WindowWorkspace
-    global HiddenByScript, Switching
+    global HiddenByScript, Switching, WorkspaceOverview, OverviewPreviewMode
 
     if Type(direction) != "Integer"
         direction := 0
 
-    if workspace < 1 || workspace > WORKSPACE_COUNT
-        return
-    if Switching
-        return
+    DebugLog("SWITCH_REQUEST", "target=D" workspace " monitor=" monitor
+        " direction=" direction " switching=" Switching)
+    if workspace < 1 || workspace > WORKSPACE_COUNT {
+        DebugLog("SWITCH_REJECT", "reason=invalid-workspace target=" workspace)
+        return false
+    }
+    if Switching {
+        DebugLog("SWITCH_REJECT", "reason=already-switching target=D" workspace
+            " monitor=" monitor)
+        return false
+    }
+
+    if WorkspaceOverview
+        CloseWorkspaceOverview(false)
 
     Switching := true
+    animation := false
     try {
         EnsureMonitorState()
-        monitor := GetMonitorUnderMouse()
         oldWorkspace := CurrentWorkspace[monitor]
+        DebugLog("SWITCH_BEGIN", "monitor=" monitor " from=D" oldWorkspace
+            " to=D" workspace " map=" DebugWorkspaceSummary(monitor))
 
         ; Discover newly opened windows before changing what is visible.
         LearnVisibleWindows()
 
         if workspace = oldWorkspace {
+            DebugLog("SWITCH_SAME", "monitor=" monitor " workspace=D" workspace)
             ShowWorkspaceOverlay(monitor, workspace, 0)
-            return
+            SetTimer(VerifyWorkspaceTransition.Bind(monitor, workspace, 0), -200)
+            return true
         }
 
         if direction = 0
             direction := workspace > oldWorkspace ? 1 : -1
 
-        ; Hide windows belonging to other workspaces on only this monitor.
+        ; The animation layer owns captured window surfaces while the real
+        ; outgoing windows are hidden underneath it.
+        animation := BeginWorkspaceSlideAnimation(
+            monitor, oldWorkspace, workspace, direction)
+
+        ; First hide every non-target window. Incoming windows remain hidden
+        ; until their captured surfaces finish sliding into place.
         for hwnd, slot in WindowWorkspace.Clone() {
             if !WinExist("ahk_id " hwnd) {
                 ForgetWindow(hwnd)
@@ -91,22 +179,61 @@ SwitchToWorkspace(workspace, direction := 0, *) {
             if slot.monitor != monitor
                 continue
 
-            if slot.workspace = workspace {
-                if HiddenByScript.Has(hwnd) {
-                    ShowWindowFast(hwnd)
-                    HiddenByScript.Delete(hwnd)
-                }
-            } else if IsVisible(hwnd) && IsManageableWindow(hwnd) {
+            if slot.workspace = workspace
+                continue
+
+            if IsVisible(hwnd) && (OverviewPreviewMode || IsManageableWindow(hwnd)) {
+                DebugLog("SWITCH_HIDE", "target=D" workspace " assigned=D" slot.workspace
+                    " " DebugDescribeWindow(hwnd))
+                if !animation
+                    CaptureWindowSnapshot(hwnd)
                 HideWindowFast(hwnd)
                 HiddenByScript[hwnd] := true
+            } else {
+                DebugLog("SWITCH_SKIP", "target=D" workspace " assigned=D" slot.workspace
+                    " visible=" IsVisible(hwnd) " manageable=" IsManageableWindow(hwnd)
+                    " scriptHidden=" HiddenByScript.Has(hwnd) " " DebugDescribeWindow(hwnd))
             }
         }
 
+        RunWorkspaceSlideAnimation(animation)
+
+        ; Reveal the real incoming windows behind the completed animation
+        ; frame, then remove that frame without any fade.
+        for hwnd, slot in WindowWorkspace.Clone() {
+            if slot.monitor != monitor || slot.workspace != workspace
+                continue
+            if !WinExist("ahk_id " hwnd) {
+                ForgetWindow(hwnd)
+                continue
+            }
+            if HiddenByScript.Has(hwnd) {
+                DebugLog("SWITCH_SHOW", "target=D" workspace " " DebugDescribeWindow(hwnd))
+                ShowWindowFast(hwnd)
+                HiddenByScript.Delete(hwnd)
+            } else {
+                DebugLog("SWITCH_KEEP", "target=D" workspace " already-not-script-hidden "
+                    DebugDescribeWindow(hwnd))
+            }
+        }
+        if animation
+            Sleep(24)
+        EndWorkspaceSlideAnimation(animation)
+        animation := false
+
         CurrentWorkspace[monitor] := workspace
+        DebugLog("SWITCH_COMMIT", "monitor=" monitor " current=D" workspace
+            " map=" DebugWorkspaceSummary(monitor))
         ShowWorkspaceOverlay(monitor, workspace, direction)
+        ScheduleWorkspaceStateSave()
+        SetTimer(VerifyWorkspaceTransition.Bind(monitor, workspace, 0), -200)
     } finally {
+        EndWorkspaceSlideAnimation(animation)
         Switching := false
+        DebugLog("SWITCH_END", "monitor=" monitor " target=D" workspace
+            " current=" (CurrentWorkspace.Has(monitor) ? "D" CurrentWorkspace[monitor] : "missing"))
     }
+    return true
 }
 
 PreviousWorkspace(*) {
@@ -136,24 +263,687 @@ MoveActiveWindowToWorkspace(workspace, *) {
         return
 
     hwnd := WinExist("A")
-    if !hwnd || !IsManageableWindow(hwnd)
+    if !hwnd || !IsManageableWindow(hwnd) {
+        DebugLog("MOVE_REJECT", "target=D" workspace " hwnd=" hwnd
+            " manageable=" (hwnd ? IsManageableWindow(hwnd) : false))
         return
+    }
 
     EnsureMonitorState()
     monitor := GetWindowMonitor(hwnd)
+    DebugLog("MOVE_ASSIGN", "target=D" workspace " monitor=" monitor " " DebugDescribeWindow(hwnd))
     WindowWorkspace[hwnd] := {monitor: monitor, workspace: workspace}
+    ScheduleWorkspaceStateSave()
 
     if workspace != CurrentWorkspace[monitor] {
+        CaptureWindowSnapshot(hwnd)
         HideWindowFast(hwnd)
         HiddenByScript[hwnd] := true
     }
 
-    ShowFeedbackForMonitor(monitor, workspace, "Window moved to")
+    ShowFeedbackForMonitor(monitor, workspace, "Moved to")
+}
+
+ToggleWorkspaceOverview(*) {
+    global WorkspaceOverview
+    if WorkspaceOverview {
+        DebugLog("OVERVIEW_TOGGLE", "action=close monitor=" WorkspaceOverview.monitor)
+        CloseWorkspaceOverview()
+        return
+    }
+    monitor := GetMonitorUnderMouse()
+    DebugLog("OVERVIEW_TOGGLE", "action=open monitor=" monitor)
+    ShowWorkspaceOverview(monitor)
+}
+
+ShowWorkspaceOverview(monitor := 0, *) {
+    global WORKSPACE_COUNT, CurrentWorkspace, WorkspaceOverview, OverviewPreviewMode
+
+    if WorkspaceOverview
+        CloseWorkspaceOverview(false)
+    if !monitor
+        monitor := GetMonitorUnderMouse()
+
+    EnsureMonitorState()
+    DebugLog("OVERVIEW_OPEN", "monitor=" monitor " current=D" CurrentWorkspace[monitor]
+        " previousActive=" DebugDescribeWindow(WinExist("A")))
+    if !OverviewPreviewMode
+        LearnVisibleWindows()
+    CancelWorkspaceOverlay(monitor)
+
+    MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
+    width := right - left
+    height := bottom - top
+    dpi := GetMonitorDpi(monitor)
+    scaleRatio := dpi / A_ScreenDPI
+    density := dpi / 96
+    previousActive := WinExist("A")
+
+    overview := Gui("+AlwaysOnTop -Caption +ToolWindow -DPIScale")
+    overview.BackColor := "070B14"
+    overview.MarginX := 0
+    overview.MarginY := 0
+    overview.OnEvent("Escape", HandleOverviewEscape)
+    overview.OnEvent("Close", HandleOverviewEscape)
+
+    state := {
+        gui: overview, hwnd: 0, monitor: monitor,
+        left: left, top: top, width: width, height: height,
+        dpi: dpi, density: density, scaleRatio: scaleRatio,
+        previousActive: previousActive,
+        paintRects: [], workspaceRects: [], windowRects: [],
+        pendingThumbnails: [], thumbnails: [], snapshotDraws: []
+    }
+    WorkspaceOverview := state
+    BuildWorkspaceOverview(state)
+
+    showWidth := Max(1, Round(width / scaleRatio))
+    showHeight := Max(1, Round(height / scaleRatio))
+    overview.Show("x" left " y" top " w" showWidth " h" showHeight)
+    state.hwnd := overview.Hwnd
+
+    ; Lock the final destination to the monitor's exact physical work area.
+    try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", -1,
+        "int", left, "int", top, "int", width, "int", height,
+        "uint", 0x0040)
+    try DllCall("InvalidateRect", "ptr", state.hwnd, "ptr", 0, "int", true)
+
+    for pending in state.pendingThumbnails
+        RegisterOverviewThumbnail(state, pending)
+
+    try WinActivate("ahk_id " state.hwnd)
+    DebugLog("OVERVIEW_READY", "monitor=" monitor " hwnd=" state.hwnd
+        " workspaceRects=" state.workspaceRects.Length
+        " windowRects=" state.windowRects.Length)
+}
+
+BuildWorkspaceOverview(state) {
+    global WORKSPACE_COUNT, CurrentWorkspace
+
+    density := state.density
+    outerPadding := Round(28 * density)
+    panelGap := Round(18 * density)
+    panelWidth := Floor((state.width - (outerPadding * 2) - (panelGap * (WORKSPACE_COUNT - 1))) / WORKSPACE_COUNT)
+    panelHeight := state.height - (outerPadding * 2)
+    headerHeight := Round(64 * density)
+    innerPadding := Round(16 * density)
+    tileGap := Round(12 * density)
+    activeWorkspace := CurrentWorkspace.Has(state.monitor) ? CurrentWorkspace[state.monitor] : 1
+
+    ; COLORREF values are BGR rather than RGB.
+    state.paintRects.Push({x: 0, y: 0, w: state.width, h: state.height, color: 0x140B07})
+
+    Loop WORKSPACE_COUNT {
+        workspace := A_Index
+        panelX := outerPadding + ((workspace - 1) * (panelWidth + panelGap))
+        panelY := outerPadding
+        border := Max(1, Round((workspace = activeWorkspace ? 3 : 1) * density))
+        borderColor := workspace = activeWorkspace ? 0xEB6325 : 0x493729
+
+        state.paintRects.Push({x: panelX, y: panelY, w: panelWidth, h: panelHeight, color: borderColor})
+        state.paintRects.Push({
+            x: panelX + border, y: panelY + border,
+            w: panelWidth - (border * 2), h: panelHeight - (border * 2),
+            color: 0x271811
+        })
+        state.workspaceRects.Push({x: panelX, y: panelY, w: panelWidth, h: panelHeight, workspace: workspace})
+
+        windows := GetOverviewWindows(state.monitor, workspace)
+        windowCount := windows.Length
+        DebugLog("OVERVIEW_PANEL", "monitor=" state.monitor " workspace=D" workspace
+            " windows=" windowCount " active=" (workspace = activeWorkspace))
+        countLabel := windowCount = 1 ? "1 window" : windowCount " windows"
+        AddOverviewText(state,
+            panelX + innerPadding, panelY + Round(12 * density),
+            panelWidth - (innerPadding * 2), Round(34 * density),
+            "D" workspace, "s20 cFFFFFF w600", "Center +0x200 BackgroundTrans")
+        AddOverviewText(state,
+            panelX + innerPadding, panelY + Round(42 * density),
+            panelWidth - (innerPadding * 2), Round(18 * density),
+            countLabel, "s9 c94A3B8 w500", "Center +0x200 BackgroundTrans")
+
+        contentX := panelX + innerPadding
+        contentY := panelY + headerHeight
+        contentWidth := panelWidth - (innerPadding * 2)
+        contentHeight := panelHeight - headerHeight - innerPadding
+
+        if !windowCount {
+            AddOverviewText(state, contentX, contentY, contentWidth, contentHeight,
+                "Empty", "s13 c64748B w500", "Center +0x200 BackgroundTrans")
+            continue
+        }
+
+        visibleCount := Min(windowCount, 9)
+        columns := visibleCount <= 2 ? 1 : visibleCount <= 6 ? 2 : 3
+        rows := Ceil(visibleCount / columns)
+        tileWidth := Floor((contentWidth - (tileGap * (columns - 1))) / columns)
+        tileHeight := Floor((contentHeight - (tileGap * (rows - 1))) / rows)
+        titleHeight := Round(30 * density)
+
+        Loop visibleCount {
+            itemIndex := A_Index
+            hwnd := windows[itemIndex]
+            DebugLog("OVERVIEW_ITEM", "monitor=" state.monitor " workspace=D" workspace
+                " item=" itemIndex " " DebugDescribeWindow(hwnd))
+            column := Mod(itemIndex - 1, columns)
+            row := Floor((itemIndex - 1) / columns)
+            tileX := contentX + (column * (tileWidth + tileGap))
+            tileY := contentY + (row * (tileHeight + tileGap))
+            previewInset := Round(7 * density)
+            previewRect := {
+                x: tileX + previewInset,
+                y: tileY + previewInset,
+                w: tileWidth - (previewInset * 2),
+                h: Max(1, tileHeight - titleHeight - (previewInset * 2))
+            }
+
+            state.paintRects.Push({x: tileX, y: tileY, w: tileWidth, h: tileHeight, color: 0x20120B})
+            state.windowRects.Push({
+                x: tileX, y: tileY, w: tileWidth, h: tileHeight,
+                workspace: workspace, hwnd: hwnd
+            })
+
+            title := GetOverviewWindowTitle(hwnd)
+            AddOverviewText(state,
+                tileX + previewInset, tileY + tileHeight - titleHeight,
+                tileWidth - (previewInset * 2), titleHeight,
+                title, "s9 cE2E8F0 w500", "Center +0x200 +0x4000 BackgroundTrans")
+            state.pendingThumbnails.Push({hwnd: hwnd, rect: previewRect})
+        }
+    }
+}
+
+GetOverviewWindows(monitor, workspace) {
+    global WindowWorkspace
+    result := []
+    seen := Map()
+
+    for hwnd in WinGetList() {
+        if !WindowWorkspace.Has(hwnd)
+            continue
+        slot := WindowWorkspace[hwnd]
+        if slot.monitor != monitor || slot.workspace != workspace
+            continue
+        if !WinExist("ahk_id " hwnd)
+            continue
+        result.Push(hwnd)
+        seen[hwnd] := true
+    }
+
+    for hwnd, slot in WindowWorkspace {
+        if seen.Has(hwnd) || slot.monitor != monitor || slot.workspace != workspace
+            continue
+        if WinExist("ahk_id " hwnd)
+            result.Push(hwnd)
+    }
+    return result
+}
+
+GetOverviewWindowTitle(hwnd) {
+    try title := Trim(WinGetTitle("ahk_id " hwnd))
+    catch
+        title := ""
+    if title
+        return title
+    try return WinGetProcessName("ahk_id " hwnd)
+    catch
+        return "Window"
+}
+
+AddOverviewText(state, x, y, width, height, text, fontOptions, controlOptions := "") {
+    options := OverviewRectOptions(x, y, width, height, state.scaleRatio)
+    if controlOptions
+        options .= " " controlOptions
+    control := state.gui.AddText(options, text)
+    control.SetFont(fontOptions, "Segoe UI")
+    return control
+}
+
+OverviewRectOptions(x, y, width, height, scaleRatio) {
+    return "x" Round(x / scaleRatio)
+        . " y" Round(y / scaleRatio)
+        . " w" Max(1, Round(width / scaleRatio))
+        . " h" Max(1, Round(height / scaleRatio))
+}
+
+RegisterOverviewThumbnail(state, pending) {
+    global HiddenByScript, WindowSnapshots
+
+    if HiddenByScript.Has(pending.hwnd) && WindowSnapshots.Has(pending.hwnd) {
+        snapshot := WindowSnapshots[pending.hwnd]
+        destination := FitOverviewRect(snapshot.width, snapshot.height, pending.rect)
+        state.snapshotDraws.Push({snapshot: snapshot, rect: destination})
+        try DllCall("InvalidateRect", "ptr", state.hwnd, "ptr", 0, "int", true)
+        return true
+    }
+
+    thumbnail := 0
+    try result := DllCall("dwmapi\DwmRegisterThumbnail",
+        "ptr", state.hwnd, "ptr", pending.hwnd, "ptr*", &thumbnail, "int")
+    catch
+        result := -1
+
+    if result != 0 || !thumbnail {
+        AddOverviewText(state,
+            pending.rect.x, pending.rect.y, pending.rect.w, pending.rect.h,
+            "Preview unavailable", "s10 c64748B w500", "Center +0x200 BackgroundTrans")
+        return false
+    }
+
+    sourceWidth := 0
+    sourceHeight := 0
+    clientRect := Buffer(16, 0)
+    if DllCall("GetClientRect", "ptr", pending.hwnd, "ptr", clientRect.Ptr) {
+        sourceWidth := NumGet(clientRect, 8, "int")
+        sourceHeight := NumGet(clientRect, 12, "int")
+    }
+    if sourceWidth <= 0 || sourceHeight <= 0 {
+        sourceSize := Buffer(8, 0)
+        if DllCall("dwmapi\DwmQueryThumbnailSourceSize", "ptr", thumbnail, "ptr", sourceSize.Ptr, "int") = 0 {
+            sourceWidth := NumGet(sourceSize, 0, "int")
+            sourceHeight := NumGet(sourceSize, 4, "int")
+        }
+    }
+
+    if sourceWidth <= 0 || sourceHeight <= 0 {
+        DllCall("dwmapi\DwmUnregisterThumbnail", "ptr", thumbnail)
+        return false
+    }
+
+    destination := FitOverviewRect(sourceWidth, sourceHeight, pending.rect)
+    drawX := destination.x
+    drawY := destination.y
+    drawWidth := destination.w
+    drawHeight := destination.h
+
+    ; DWM_THUMBNAIL_PROPERTIES: flags, destination/source RECTs, opacity, visibility.
+    properties := Buffer(48, 0)
+    NumPut("uint", 0x1D, properties, 0)
+    NumPut("int", drawX, "int", drawY,
+        "int", drawX + drawWidth, "int", drawY + drawHeight, properties, 4)
+    NumPut("uchar", 255, properties, 36)
+    NumPut("int", 1, properties, 40)
+    NumPut("int", 1, properties, 44)
+
+    result := DllCall("dwmapi\DwmUpdateThumbnailProperties",
+        "ptr", thumbnail, "ptr", properties.Ptr, "int")
+    if result != 0 {
+        DllCall("dwmapi\DwmUnregisterThumbnail", "ptr", thumbnail)
+        return false
+    }
+
+    state.thumbnails.Push(thumbnail)
+    return true
+}
+
+FitOverviewRect(sourceWidth, sourceHeight, bounds) {
+    fit := Min(bounds.w / sourceWidth, bounds.h / sourceHeight)
+    width := Max(1, Round(sourceWidth * fit))
+    height := Max(1, Round(sourceHeight * fit))
+    return {
+        x: bounds.x + Floor((bounds.w - width) / 2),
+        y: bounds.y + Floor((bounds.h - height) / 2),
+        w: width, h: height
+    }
+}
+
+PaintWorkspaceOverview(wParam, lParam, msg, hwnd) {
+    global WorkspaceOverview
+    if !WorkspaceOverview || !WorkspaceOverview.hwnd || hwnd != WorkspaceOverview.hwnd
+        return
+
+    state := WorkspaceOverview
+    paint := Buffer(72, 0)
+    hdc := DllCall("BeginPaint", "ptr", hwnd, "ptr", paint.Ptr, "ptr")
+    if !hdc
+        return
+
+    for item in state.paintRects {
+        rect := Buffer(16, 0)
+        NumPut("int", item.x, "int", item.y,
+            "int", item.x + item.w, "int", item.y + item.h, rect, 0)
+        brush := DllCall("CreateSolidBrush", "uint", item.color, "ptr")
+        DllCall("FillRect", "ptr", hdc, "ptr", rect.Ptr, "ptr", brush)
+        DllCall("DeleteObject", "ptr", brush)
+    }
+
+    for item in state.snapshotDraws
+        DrawOverviewSnapshot(hdc, item.snapshot, item.rect)
+    DllCall("EndPaint", "ptr", hwnd, "ptr", paint.Ptr)
+    return 0
+}
+
+DrawOverviewSnapshot(destinationDc, snapshot, rect) {
+    sourceDc := DllCall("CreateCompatibleDC", "ptr", destinationDc, "ptr")
+    if !sourceDc
+        return
+    oldBitmap := DllCall("SelectObject", "ptr", sourceDc, "ptr", snapshot.bitmap, "ptr")
+    DllCall("SetStretchBltMode", "ptr", destinationDc, "int", 4)
+    DllCall("StretchBlt",
+        "ptr", destinationDc, "int", rect.x, "int", rect.y, "int", rect.w, "int", rect.h,
+        "ptr", sourceDc, "int", 0, "int", 0, "int", snapshot.width, "int", snapshot.height,
+        "uint", 0x00CC0020)
+    DllCall("SelectObject", "ptr", sourceDc, "ptr", oldBitmap)
+    DllCall("DeleteDC", "ptr", sourceDc)
+}
+
+HandleOverviewClick(wParam, lParam, msg, hwnd) {
+    global WorkspaceOverview
+    if !WorkspaceOverview || !WorkspaceOverview.hwnd
+        return
+
+    state := WorkspaceOverview
+    if hwnd != state.hwnd && !DllCall("IsChild", "ptr", state.hwnd, "ptr", hwnd)
+        return
+
+    point := Buffer(8, 0)
+    if !DllCall("GetCursorPos", "ptr", point.Ptr)
+        return
+    if !DllCall("ScreenToClient", "ptr", state.hwnd, "ptr", point.Ptr)
+        return
+    x := NumGet(point, 0, "int")
+    y := NumGet(point, 4, "int")
+    DebugLog("OVERVIEW_CLICK", "messageHwnd=" hwnd " overviewHwnd=" state.hwnd
+        " monitor=" state.monitor " client=" x "," y)
+
+    for item in state.windowRects {
+        if PointInsideOverviewRect(x, y, item) {
+            targetHwnd := item.hwnd
+            targetWorkspace := item.workspace
+            targetMonitor := state.monitor
+            DebugLog("OVERVIEW_WINDOW_HIT", "workspace=D" targetWorkspace
+                " monitor=" targetMonitor " rect=" item.x "," item.y "," item.w "," item.h
+                " " DebugDescribeWindow(targetHwnd))
+            CloseWorkspaceOverview(false)
+            ; Finish the workspace transition outside WM_LBUTTONUP. The selected
+            ; window is revealed only after that transition is confirmed.
+            SetTimer(CompleteOverviewWindowSelection.Bind(
+                targetHwnd, targetWorkspace, targetMonitor, 0), -1)
+            return 0
+        }
+    }
+
+    for item in state.workspaceRects {
+        if PointInsideOverviewRect(x, y, item) {
+            targetWorkspace := item.workspace
+            targetMonitor := state.monitor
+            DebugLog("OVERVIEW_PANEL_HIT", "workspace=D" targetWorkspace
+                " monitor=" targetMonitor " rect=" item.x "," item.y "," item.w "," item.h)
+            CloseWorkspaceOverview(false)
+            SwitchToWorkspaceOnMonitor(targetWorkspace, targetMonitor)
+            return 0
+        }
+    }
+
+    DebugLog("OVERVIEW_CLICK_MISS", "monitor=" state.monitor " client=" x "," y)
+    CloseWorkspaceOverview()
+    return 0
+}
+
+PointInsideOverviewRect(x, y, rect) {
+    return x >= rect.x && x < rect.x + rect.w
+        && y >= rect.y && y < rect.y + rect.h
+}
+
+CompleteOverviewWindowSelection(hwnd, workspace, monitor, attempt := 0) {
+    global CurrentWorkspace, Switching
+    DebugLog("SELECTION_STEP", "attempt=" attempt " workspace=D" workspace
+        " monitor=" monitor " switching=" Switching " current="
+        (CurrentWorkspace.Has(monitor) ? "D" CurrentWorkspace[monitor] : "missing")
+        " " DebugDescribeWindow(hwnd))
+    if !WinExist("ahk_id " hwnd) {
+        DebugLog("SELECTION_ABORT", "reason=window-gone hwnd=" hwnd)
+        return
+    }
+
+    ; A hotkey or another monitor may already be switching. Wait for it to
+    ; finish instead of revealing one window on the currently displayed D-slot.
+    if Switching {
+        DebugLog("SELECTION_WAIT", "reason=switch-in-progress attempt=" attempt)
+        if attempt < 10
+            SetTimer(CompleteOverviewWindowSelection.Bind(
+                hwnd, workspace, monitor, attempt + 1), -50)
+        return
+    }
+
+    switched := SwitchToWorkspaceOnMonitor(workspace, monitor)
+    if !switched || !CurrentWorkspace.Has(monitor)
+        || CurrentWorkspace[monitor] != workspace {
+        DebugLog("SELECTION_WAIT", "reason=switch-not-committed switched=" switched
+            " expected=D" workspace " actual="
+            (CurrentWorkspace.Has(monitor) ? "D" CurrentWorkspace[monitor] : "missing")
+            " attempt=" attempt)
+        if attempt < 10
+            SetTimer(CompleteOverviewWindowSelection.Bind(
+                hwnd, workspace, monitor, attempt + 1), -50)
+        return
+    }
+
+    DebugLog("SELECTION_COMMITTED", "workspace=D" workspace " monitor=" monitor
+        " activationDelayMs=80 " DebugDescribeWindow(hwnd))
+    SetTimer(ActivateOverviewWindow.Bind(hwnd, monitor, workspace, 0), -80)
+}
+
+ActivateOverviewWindow(hwnd, monitor, workspace, attempt := 0) {
+    global CurrentWorkspace, HiddenByScript
+    DebugLog("ACTIVATE_ATTEMPT", "attempt=" attempt " workspace=D" workspace
+        " monitor=" monitor " current="
+        (CurrentWorkspace.Has(monitor) ? "D" CurrentWorkspace[monitor] : "missing")
+        " activeHwnd=" WinExist("A") " " DebugDescribeWindow(hwnd))
+    if !WinExist("ahk_id " hwnd) {
+        DebugLog("ACTIVATE_ABORT", "reason=window-gone hwnd=" hwnd)
+        return
+    }
+
+    ; Do not leak the selected window into another workspace if the user starts
+    ; a new switch during the short activation delay or focus retry period.
+    if !CurrentWorkspace.Has(monitor) || CurrentWorkspace[monitor] != workspace {
+        DebugLog("ACTIVATE_ABORT", "reason=workspace-mismatch expected=D" workspace
+            " actual=" (CurrentWorkspace.Has(monitor) ? "D" CurrentWorkspace[monitor] : "missing"))
+        return
+    }
+
+    if HiddenByScript.Has(hwnd)
+        HiddenByScript.Delete(hwnd)
+
+    try minimized := WinGetMinMax("ahk_id " hwnd) = -1
+    catch
+        minimized := false
+    ; A direct restore/show is intentional here: clicking a preview means the
+    ; user explicitly wants that exact window in the foreground.
+    try DllCall("ShowWindow", "ptr", hwnd, "int", minimized ? 9 : 5)
+    if minimized
+        try WinRestore("ahk_id " hwnd)
+    try WinActivate("ahk_id " hwnd)
+    try DllCall("SetForegroundWindow", "ptr", hwnd)
+
+    ; Focusing some applications can briefly cover a newly created overlay.
+    ; Refresh it after focus so app-preview clicks visibly confirm D1/D2/D3,
+    ; exactly like the numbered and previous/next hotkeys.
+    if attempt = 0
+        ShowWorkspaceOverlay(monitor, workspace, 0)
+
+    activated := WinActive("ahk_id " hwnd) != 0
+    DebugLog("ACTIVATE_RESULT", "attempt=" attempt " activated=" activated
+        " activeHwnd=" WinExist("A") " visible=" IsVisible(hwnd)
+        " scriptHidden=" HiddenByScript.Has(hwnd) " " DebugDescribeWindow(hwnd))
+    if !activated && attempt < 5
+        SetTimer(ActivateOverviewWindow.Bind(
+            hwnd, monitor, workspace, attempt + 1), -120)
+}
+
+HandleOverviewEscape(*) {
+    CloseWorkspaceOverview()
+}
+
+CloseWorkspaceOverview(restoreFocus := true, *) {
+    global WorkspaceOverview, OverviewHotCornerCooldownUntil
+    if !WorkspaceOverview
+        return
+
+    state := WorkspaceOverview
+    DebugLog("OVERVIEW_CLOSE", "monitor=" state.monitor " restoreFocus=" restoreFocus
+        " previousActive=" state.previousActive)
+    WorkspaceOverview := false
+    for thumbnail in state.thumbnails
+        try DllCall("dwmapi\DwmUnregisterThumbnail", "ptr", thumbnail)
+    try state.gui.Destroy()
+
+    OverviewHotCornerCooldownUntil := A_TickCount + 900
+    if restoreFocus && state.previousActive && WinExist("ahk_id " state.previousActive)
+        try WinActivate("ahk_id " state.previousActive)
+}
+
+CheckWorkspaceOverviewHotCorner() {
+    global WorkspaceOverview, OverviewHotCornerMonitor, OverviewHotCornerEnteredAt
+    global OverviewHotCornerCooldownUntil
+
+    if WorkspaceOverview {
+        OverviewHotCornerMonitor := 0
+        OverviewHotCornerEnteredAt := 0
+        return
+    }
+    if A_TickCount < OverviewHotCornerCooldownUntil
+        return
+
+    point := Buffer(8, 0)
+    if !DllCall("GetCursorPos", "ptr", point.Ptr)
+        return
+    x := NumGet(point, 0, "int")
+    y := NumGet(point, 4, "int")
+    monitor := GetMonitorUnderMouse()
+    MonitorGet(monitor, &left, &top, &right, &bottom)
+    threshold := Max(3, Round(4 * (GetMonitorDpi(monitor) / 96)))
+    inCorner := x >= left && x <= left + threshold && y >= top && y <= top + threshold
+
+    if !inCorner {
+        OverviewHotCornerMonitor := 0
+        OverviewHotCornerEnteredAt := 0
+        return
+    }
+
+    if OverviewHotCornerMonitor != monitor {
+        OverviewHotCornerMonitor := monitor
+        OverviewHotCornerEnteredAt := A_TickCount
+        return
+    }
+
+    if A_TickCount - OverviewHotCornerEnteredAt >= 500 {
+        OverviewHotCornerMonitor := 0
+        OverviewHotCornerEnteredAt := 0
+        OverviewHotCornerCooldownUntil := A_TickCount + 1500
+        ShowWorkspaceOverview(monitor)
+    }
+}
+
+GetMonitorDpi(monitor) {
+    MonitorGet(monitor, &left, &top, &right, &bottom)
+    point := Buffer(8, 0)
+    NumPut("int", left + 1, "int", top + 1, point, 0)
+    hMonitor := DllCall("MonitorFromPoint", "int64", NumGet(point, 0, "int64"),
+        "uint", 2, "ptr")
+    dpiX := A_ScreenDPI
+    dpiY := A_ScreenDPI
+    try {
+        if DllCall("Shcore\GetDpiForMonitor", "ptr", hMonitor, "int", 0,
+            "uint*", &dpiX, "uint*", &dpiY, "int") != 0
+            dpiX := A_ScreenDPI
+    }
+    return dpiX > 0 ? dpiX : A_ScreenDPI
+}
+
+SetupWorkspaceOverviewPreview(monitor) {
+    global CurrentWorkspace, WindowWorkspace, HiddenByScript
+    global OverviewPreviewWindows, OverviewPreviewMode
+
+    OverviewPreviewMode := true
+    CurrentWorkspace[monitor] := 1
+    colors := ["173B66", "4C1D95", "14532D", "7C2D12", "164E63", "713F12"]
+    labels := ["Browser", "Notes", "Editor", "Terminal", "Calendar", "Files"]
+
+    Loop 3 {
+        workspace := A_Index
+        Loop 2 {
+            item := A_Index
+            colorIndex := ((workspace - 1) * 2) + item
+            source := Gui("+ToolWindow -DPIScale", "D" workspace " - " labels[colorIndex])
+            source.BackColor := colors[colorIndex]
+            source.MarginX := 0
+            source.MarginY := 0
+            source.SetFont("s24 cFFFFFF w600", "Segoe UI")
+            source.AddText("x0 y0 w520 h300 Center +0x200 BackgroundTrans",
+                "D" workspace "`n" labels[colorIndex])
+            source.Show("x80 y80 w520 h300")
+            WindowWorkspace[source.Hwnd] := {monitor: monitor, workspace: workspace}
+            OverviewPreviewWindows.Push({gui: source, workspace: workspace, hwnd: source.Hwnd})
+        }
+    }
+
+    SetTimer(LaunchWorkspaceOverviewPreview.Bind(monitor), -350)
+    SetTimer((*) => ExitApp(), -8000)
+}
+
+LaunchWorkspaceOverviewPreview(monitor) {
+    global OverviewPreviewWindows, HiddenByScript
+    for item in OverviewPreviewWindows {
+        if item.workspace = 1
+            continue
+        CaptureWindowSnapshot(item.hwnd)
+        item.gui.Hide()
+        HiddenByScript[item.hwnd] := true
+    }
+    ShowWorkspaceOverview(monitor)
+}
+
+SetupWorkspaceSlidePreview(monitor) {
+    global CurrentWorkspace, WindowWorkspace, HiddenByScript
+    global OverviewPreviewWindows, OverviewPreviewMode
+
+    OverviewPreviewMode := true
+    CurrentWorkspace[monitor] := 1
+    MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
+    colors := ["173B66", "4C1D95", "14532D", "7C2D12"]
+    labels := ["D1 Browser", "D1 Notes", "D2 Editor", "D2 Terminal"]
+
+    Loop 4 {
+        item := A_Index
+        workspace := item <= 2 ? 1 : 2
+        column := Mod(item - 1, 2)
+        source := Gui("+ToolWindow -DPIScale", labels[item])
+        source.BackColor := colors[item]
+        source.MarginX := 0
+        source.MarginY := 0
+        source.SetFont("s24 cFFFFFF w600", "Segoe UI")
+        source.AddText("x0 y0 w520 h300 Center +0x200 BackgroundTrans", labels[item])
+        source.Show("x" (left + 120 + column * 600) " y" (top + 180)
+            " w520 h300")
+        WindowWorkspace[source.Hwnd] := {monitor: monitor, workspace: workspace}
+        OverviewPreviewWindows.Push({gui: source, workspace: workspace, hwnd: source.Hwnd})
+        if workspace = 2 {
+            CaptureWindowSnapshot(source.Hwnd)
+            source.Hide()
+            HiddenByScript[source.Hwnd] := true
+        }
+    }
+
+    SetTimer(RunWorkspaceSlidePreview.Bind(monitor, 1), -450)
+    SetTimer((*) => ExitApp(), -2600)
+}
+
+RunWorkspaceSlidePreview(monitor, step) {
+    if step = 1 {
+        SwitchToWorkspaceOnMonitor(2, monitor, 1)
+        SetTimer(RunWorkspaceSlidePreview.Bind(monitor, 2), -650)
+    } else {
+        SwitchToWorkspaceOnMonitor(1, monitor, -1)
+    }
 }
 
 LearnVisibleWindows() {
     global CurrentWorkspace, WindowWorkspace, HiddenByScript
 
+    learned := 0
+    moved := 0
     for hwnd in WinGetList() {
         if HiddenByScript.Has(hwnd)
             continue
@@ -166,6 +956,9 @@ LearnVisibleWindows() {
                 monitor: monitor,
                 workspace: CurrentWorkspace[monitor]
             }
+            learned += 1
+            DebugLog("WINDOW_LEARN", "monitor=" monitor " workspace=D" CurrentWorkspace[monitor]
+                " " DebugDescribeWindow(hwnd))
             continue
         }
 
@@ -173,12 +966,22 @@ LearnVisibleWindows() {
         ; currently displayed there.
         slot := WindowWorkspace[hwnd]
         if slot.monitor != monitor {
+            oldMonitor := slot.monitor
+            oldWorkspace := slot.workspace
             WindowWorkspace[hwnd] := {
                 monitor: monitor,
                 workspace: CurrentWorkspace[monitor]
             }
+            moved += 1
+            DebugLog("WINDOW_MONITOR_MOVE", "fromMonitor=" oldMonitor
+                " fromWorkspace=D" oldWorkspace " toMonitor=" monitor
+                " toWorkspace=D" CurrentWorkspace[monitor] " " DebugDescribeWindow(hwnd))
         }
     }
+    DebugLog("WINDOW_SCAN_END", "learned=" learned " moved=" moved
+        " tracked=" WindowWorkspace.Count " scriptHidden=" HiddenByScript.Count)
+    if learned || moved
+        ScheduleWorkspaceStateSave()
 }
 
 IsManageableWindow(hwnd) {
@@ -207,9 +1010,22 @@ IsManageableWindow(hwnd) {
         "MsgrIMEWindowClass", true,
         "SysShadow", true,
         "Windows.UI.Core.CoreWindow", true,
+        "EdgeUiInputTopWndClass", true,
+        "RaycastUIAccessHelper", true,
         "AutoHotkeyGUI", true
     )
     if ignoredClasses.Has(class)
+        return false
+
+    ; Windows Widgets exposes a browser-class helper window, but it is a shell
+    ; surface rather than a workspace app.
+    try processName := WinGetProcessName("ahk_id " hwnd)
+    catch
+        processName := ""
+    try title := WinGetTitle("ahk_id " hwnd)
+    catch
+        title := ""
+    if StrLower(processName) = "msedgewebview2.exe" && title = "Widgets"
         return false
 
     ; Do not adopt windows hidden by their own application. Windows already
@@ -235,12 +1051,126 @@ IsVisible(hwnd) {
 
 HideWindowFast(hwnd) {
     ; SW_HIDE = 0. Post to the owning UI thread without waiting for each app.
-    try DllCall("ShowWindowAsync", "ptr", hwnd, "int", 0)
+    try {
+        result := DllCall("ShowWindowAsync", "ptr", hwnd, "int", 0)
+        DebugLog("WINDOW_HIDE_ASYNC", "result=" result " " DebugDescribeWindow(hwnd))
+        return result
+    } catch as error {
+        DebugLog("WINDOW_HIDE_ERROR", "message=" DebugClean(error.Message) " " DebugDescribeWindow(hwnd))
+        return false
+    }
 }
 
 ShowWindowFast(hwnd) {
     ; SW_SHOWNA = 8: show without activation or restoring minimized windows.
-    try DllCall("ShowWindowAsync", "ptr", hwnd, "int", 8)
+    try {
+        result := DllCall("ShowWindowAsync", "ptr", hwnd, "int", 8)
+        DebugLog("WINDOW_SHOW_ASYNC", "result=" result " " DebugDescribeWindow(hwnd))
+        return result
+    } catch as error {
+        DebugLog("WINDOW_SHOW_ERROR", "message=" DebugClean(error.Message) " " DebugDescribeWindow(hwnd))
+        return false
+    }
+}
+
+CaptureWindowSnapshot(hwnd) {
+    global WindowSnapshots
+    if !WinExist("ahk_id " hwnd)
+        return false
+
+    windowRect := Buffer(16, 0)
+    if !DllCall("GetWindowRect", "ptr", hwnd, "ptr", windowRect.Ptr)
+        return false
+    left := NumGet(windowRect, 0, "int")
+    top := NumGet(windowRect, 4, "int")
+    width := NumGet(windowRect, 8, "int") - left
+    height := NumGet(windowRect, 12, "int") - top
+    if width <= 0 || height <= 0
+        return false
+
+    screenDc := DllCall("GetDC", "ptr", 0, "ptr")
+    memoryDc := DllCall("CreateCompatibleDC", "ptr", screenDc, "ptr")
+    bitmap := DllCall("CreateCompatibleBitmap", "ptr", screenDc,
+        "int", width, "int", height, "ptr")
+    if !screenDc || !memoryDc || !bitmap {
+        if bitmap
+            DllCall("DeleteObject", "ptr", bitmap)
+        if memoryDc
+            DllCall("DeleteDC", "ptr", memoryDc)
+        if screenDc
+            DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
+        return false
+    }
+
+    oldBitmap := DllCall("SelectObject", "ptr", memoryDc, "ptr", bitmap, "ptr")
+    captured := false
+    try captured := DllCall("PrintWindow", "ptr", hwnd, "ptr", memoryDc, "uint", 2, "int") != 0
+    if !captured {
+        captured := DllCall("BitBlt", "ptr", memoryDc,
+            "int", 0, "int", 0, "int", width, "int", height,
+            "ptr", screenDc, "int", left, "int", top, "uint", 0x00CC0020, "int") != 0
+    }
+
+    sourceRestored := false
+    if captured && Max(width, height) > 1280 {
+        resizeScale := 1280 / Max(width, height)
+        resizedWidth := Max(1, Round(width * resizeScale))
+        resizedHeight := Max(1, Round(height * resizeScale))
+        resizedDc := DllCall("CreateCompatibleDC", "ptr", screenDc, "ptr")
+        resizedBitmap := DllCall("CreateCompatibleBitmap", "ptr", screenDc,
+            "int", resizedWidth, "int", resizedHeight, "ptr")
+        if resizedDc && resizedBitmap {
+            oldResizedBitmap := DllCall("SelectObject", "ptr", resizedDc, "ptr", resizedBitmap, "ptr")
+            DllCall("SetStretchBltMode", "ptr", resizedDc, "int", 4)
+            resized := DllCall("StretchBlt",
+                "ptr", resizedDc, "int", 0, "int", 0, "int", resizedWidth, "int", resizedHeight,
+                "ptr", memoryDc, "int", 0, "int", 0, "int", width, "int", height,
+                "uint", 0x00CC0020, "int") != 0
+            DllCall("SelectObject", "ptr", resizedDc, "ptr", oldResizedBitmap)
+            if resized {
+                DllCall("SelectObject", "ptr", memoryDc, "ptr", oldBitmap)
+                sourceRestored := true
+                DllCall("DeleteObject", "ptr", bitmap)
+                bitmap := resizedBitmap
+                width := resizedWidth
+                height := resizedHeight
+            } else {
+                DllCall("DeleteObject", "ptr", resizedBitmap)
+            }
+        }
+        if resizedDc
+            DllCall("DeleteDC", "ptr", resizedDc)
+    }
+
+    if !sourceRestored
+        DllCall("SelectObject", "ptr", memoryDc, "ptr", oldBitmap)
+    DllCall("DeleteDC", "ptr", memoryDc)
+    DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
+
+    if !captured {
+        DllCall("DeleteObject", "ptr", bitmap)
+        return false
+    }
+
+    DeleteWindowSnapshot(hwnd)
+    WindowSnapshots[hwnd] := {bitmap: bitmap, width: width, height: height}
+    return true
+}
+
+DeleteWindowSnapshot(hwnd) {
+    global WindowSnapshots
+    if !WindowSnapshots.Has(hwnd)
+        return
+    snapshot := WindowSnapshots[hwnd]
+    if snapshot.bitmap
+        try DllCall("DeleteObject", "ptr", snapshot.bitmap)
+    WindowSnapshots.Delete(hwnd)
+}
+
+ClearWindowSnapshots() {
+    global WindowSnapshots
+    for hwnd in WindowSnapshots.Clone()
+        DeleteWindowSnapshot(hwnd)
 }
 
 GetMonitorUnderMouse() {
@@ -291,11 +1221,13 @@ ForgetWindow(hwnd) {
         WindowWorkspace.Delete(hwnd)
     if HiddenByScript.Has(hwnd)
         HiddenByScript.Delete(hwnd)
+    DeleteWindowSnapshot(hwnd)
 }
 
 HandleDisplayChange(*) {
     ; Windows broadcasts WM_DISPLAYCHANGE after monitor connect/disconnect,
     ; resolution changes, docking, and topology changes. Debounce the reset.
+    DebugLog("DISPLAY_CHANGE", "debounceMs=750")
     SetTimer(ResetAfterDisplayChange, -750)
 }
 
@@ -310,67 +1242,208 @@ ResetAfterDisplayChange() {
 
 RestoreAllWindows(*) {
     global HiddenByScript
+    DebugLog("RESTORE_ALL_BEGIN", "count=" HiddenByScript.Count)
     for hwnd in HiddenByScript.Clone() {
-        if WinExist("ahk_id " hwnd)
+        if WinExist("ahk_id " hwnd) {
+            DebugLog("RESTORE_ALL_WINDOW", DebugDescribeWindow(hwnd))
             ShowWindowFast(hwnd)
+        }
     }
     HiddenByScript.Clear()
+    DebugLog("RESTORE_ALL_END", "count=0")
+}
+
+HandleAppExit(*) {
+    DebugLog("APP_EXIT", "begin")
+    SaveWorkspaceState()
+    CloseWorkspaceOverview(false)
+    RestoreAllWindows()
+    ClearWindowSnapshots()
+    DebugLog("APP_EXIT", "complete")
 }
 
 ResetAndRevealAll(*) {
     global CurrentWorkspace, WindowWorkspace
+    DebugLog("RESET", "begin")
+    CloseWorkspaceOverview(false)
     RestoreAllWindows()
     WindowWorkspace.Clear()
+    ClearWindowSnapshots()
     CurrentWorkspace.Clear()
     InitializeMonitors()
+    SaveWorkspaceState()
     ShowFeedbackForMonitor(GetMonitorUnderMouse(), 1, "Reset to")
+    DebugLog("RESET", "complete")
 }
 
-ShowWorkspaceOverlay(monitor, workspace, direction := 0, prefix := "WORKSPACE") {
-    global SHOW_FEEDBACK, WORKSPACE_COUNT, ANIMATION_MS, WorkspaceOverlays
+BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction) {
+    global WORKSPACE_SLIDE_MS, OverviewPreviewMode
+
+    MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
+    width := right - left
+    height := bottom - top
+    layer := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20 -DPIScale")
+    layer.BackColor := "010203"
+    layer.MarginX := 0
+    layer.MarginY := 0
+    state := {
+        gui: layer, hwnd: 0, monitor: monitor,
+        left: left, top: top, width: width, height: height,
+        oldWorkspace: oldWorkspace, newWorkspace: newWorkspace,
+        direction: direction, duration: WORKSPACE_SLIDE_MS,
+        outgoing: [], incoming: []
+    }
+
+    AddWorkspaceSlideItems(state, oldWorkspace, false, OverviewPreviewMode)
+    AddWorkspaceSlideItems(state, newWorkspace, true, OverviewPreviewMode)
+    if !state.outgoing.Length && !state.incoming.Length {
+        try layer.Destroy()
+        DebugLog("SLIDE_SKIP", "reason=no-renderable-windows monitor=" monitor
+            " from=D" oldWorkspace " to=D" newWorkspace)
+        return false
+    }
+
+    layer.Show("NA x" left " y" top " w" width " h" height)
+    state.hwnd := layer.Hwnd
+    try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", -1,
+        "int", left, "int", top, "int", width, "int", height,
+        "uint", 0x0050)
+    ; Only the captured windows are opaque. The desktop and taskbar remain live
+    ; behind the animation layer, with no opacity animation or crossfade.
+    try WinSetTransColor("010203", "ahk_id " state.hwnd)
+    Sleep(20)
+    DebugLog("SLIDE_BEGIN", "monitor=" monitor " from=D" oldWorkspace
+        " to=D" newWorkspace " direction=" direction
+        " outgoing=" state.outgoing.Length " incoming=" state.incoming.Length
+        " durationMs=" state.duration)
+    return state
+}
+
+AddWorkspaceSlideItems(state, workspace, incoming, allowPreviewWindows := false) {
+    global WindowSnapshots
+    windows := GetOverviewWindows(state.monitor, workspace)
+
+    ; GetOverviewWindows is front-to-back. Add controls back-to-front so their
+    ; captured surfaces retain the same stacking order as the real windows.
+    Loop windows.Length {
+        hwnd := windows[windows.Length - A_Index + 1]
+        if !WinExist("ahk_id " hwnd)
+            continue
+        if !allowPreviewWindows && !IsManageableWindow(hwnd)
+            continue
+        try minimized := WinGetMinMax("ahk_id " hwnd) = -1
+        catch
+            minimized := false
+        if minimized
+            continue
+
+        if !incoming || !WindowSnapshots.Has(hwnd)
+            CaptureWindowSnapshot(hwnd)
+        if !WindowSnapshots.Has(hwnd) {
+            DebugLog("SLIDE_ITEM_SKIP", "reason=no-snapshot incoming=" incoming
+                " workspace=D" workspace " " DebugDescribeWindow(hwnd))
+            continue
+        }
+
+        rect := Buffer(16, 0)
+        if !DllCall("GetWindowRect", "ptr", hwnd, "ptr", rect.Ptr)
+            continue
+        windowLeft := NumGet(rect, 0, "int")
+        windowTop := NumGet(rect, 4, "int")
+        windowWidth := NumGet(rect, 8, "int") - windowLeft
+        windowHeight := NumGet(rect, 12, "int") - windowTop
+        if windowWidth <= 0 || windowHeight <= 0
+            continue
+
+        baseX := windowLeft - state.left
+        baseY := windowTop - state.top
+        startingOffset := incoming ? state.direction * state.width : 0
+        snapshot := WindowSnapshots[hwnd]
+        control := state.gui.AddPicture(
+            "x" (baseX + startingOffset) " y" baseY
+            " w" windowWidth " h" windowHeight,
+            "HBITMAP:*" snapshot.bitmap)
+        item := {control: control, hwnd: hwnd, baseX: baseX, baseY: baseY}
+        if incoming
+            state.incoming.Push(item)
+        else
+            state.outgoing.Push(item)
+    }
+}
+
+RunWorkspaceSlideAnimation(state) {
+    if !state
+        return
+
+    started := A_TickCount
+    Loop {
+        progress := Min(1, (A_TickCount - started) / state.duration)
+        ; Ease-in-out cubic gives the transition weight without overshoot.
+        eased := progress < 0.5
+            ? 4 * progress * progress * progress
+            : 1 - (((-2 * progress + 2) ** 3) / 2)
+        outgoingOffset := Round(-state.direction * state.width * eased)
+        incomingOffset := Round(state.direction * state.width * (1 - eased))
+
+        for item in state.outgoing
+            try item.control.Move(item.baseX + outgoingOffset, item.baseY)
+        for item in state.incoming
+            try item.control.Move(item.baseX + incomingOffset, item.baseY)
+
+        try DllCall("RedrawWindow", "ptr", state.hwnd, "ptr", 0, "ptr", 0,
+            "uint", 0x0101)
+        if progress >= 1
+            break
+        Sleep(10)
+    }
+    DebugLog("SLIDE_COMPLETE", "monitor=" state.monitor " from=D" state.oldWorkspace
+        " to=D" state.newWorkspace " elapsedMs=" (A_TickCount - started))
+}
+
+EndWorkspaceSlideAnimation(state) {
+    if !state
+        return
+    try state.gui.Destroy()
+    DebugLog("SLIDE_END", "monitor=" state.monitor " from=D" state.oldWorkspace
+        " to=D" state.newWorkspace)
+}
+
+ShowWorkspaceOverlay(monitor, workspace, direction := 0) {
+    global SHOW_FEEDBACK, INDICATOR_MS, WorkspaceOverlays
     if !SHOW_FEEDBACK
         return
 
+    DebugLog("OVERLAY_SHOW", "monitor=" monitor " workspace=D" workspace
+        " direction=" direction)
     CancelWorkspaceOverlay(monitor)
     MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
 
-    width := 280
-    height := 88
+    width := 78
+    height := 44
     targetX := left + ((right - left - width) // 2)
-    targetY := top + 42
-    startX := targetX + (direction * 90)
-    label := direction > 0 ? prefix " " workspace "  ›"
-        : direction < 0 ? "‹  " prefix " " workspace
-        : prefix " " workspace
+    targetY := top + 20
+    label := "D" workspace
 
-    overlay := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20")
+    overlay := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20 -DPIScale")
     overlay.BackColor := "111827"
     overlay.MarginX := 0
     overlay.MarginY := 0
-    overlay.SetFont("s9 c9CA3AF w600", "Segoe UI")
-    overlay.AddText("x20 y12 w240 h18 Center BackgroundTrans", "MONITOR " monitor)
-    overlay.SetFont("s18 cFFFFFF w600", "Segoe UI Variable Display")
-    overlay.AddText("x15 y32 w250 h30 Center BackgroundTrans", label)
+    overlay.SetFont("s18 cFFFFFF w600", "Segoe UI")
+    overlay.AddText("x0 y0 w78 h44 Center +0x200 BackgroundTrans", label)
 
-    dots := ""
-    Loop WORKSPACE_COUNT
-        dots .= (A_Index = workspace ? "●" : "○") "  "
-    overlay.SetFont("s9 c60A5FA w600", "Segoe UI Symbol")
-    overlay.AddText("x20 y65 w240 h16 Center BackgroundTrans", RTrim(dots))
-
-    overlay.Show("NA x" startX " y" targetY " w" width " h" height)
+    overlay.Show("NA x" targetX " y" targetY " w" width " h" height)
     hwnd := overlay.Hwnd
-    try WinSetRegion("0-0 W" width " H" height " R18-18", "ahk_id " hwnd)
-    try WinSetTransparent(0, "ahk_id " hwnd)
+    try WinSetRegion("0-0 W" width " H" height " R12-12", "ahk_id " hwnd)
+    try WinSetTransparent(238, "ahk_id " hwnd)
 
     state := {
         gui: overlay, hwnd: hwnd, monitor: monitor,
-        startX: startX, targetX: targetX, y: targetY,
-        started: A_TickCount, duration: ANIMATION_MS
+        workspace: workspace,
+        targetX: targetX, y: targetY
     }
-    state.moveTimer := AnimateWorkspaceOverlay.Bind(state)
+    state.dismissTimer := CancelWorkspaceOverlay.Bind(monitor)
     WorkspaceOverlays[monitor] := state
-    SetTimer(state.moveTimer, 16)
+    SetTimer(state.dismissTimer, -INDICATOR_MS)
 }
 
 AnimateWorkspaceOverlay(state) {
@@ -426,15 +1499,314 @@ CancelWorkspaceOverlay(monitor) {
         return
 
     state := WorkspaceOverlays[monitor]
-    try SetTimer(state.moveTimer, 0)
+    ; Relinquish ownership before stopping timers or destroying the GUI. Those
+    ; operations can dispatch pending timer/window messages re-entrantly; any
+    ; duplicate cancellation must see that this overlay is already gone.
+    WorkspaceOverlays.Delete(monitor)
+    DebugLog("OVERLAY_CANCEL", "monitor=" monitor " workspace=D" state.workspace
+        " hwnd=" state.hwnd)
+    if state.HasOwnProp("moveTimer")
+        try SetTimer(state.moveTimer, 0)
+    if state.HasOwnProp("dismissTimer")
+        try SetTimer(state.dismissTimer, 0)
     if state.HasOwnProp("fadeTimer")
         try SetTimer(state.fadeTimer, 0)
     try state.gui.Destroy()
-    WorkspaceOverlays.Delete(monitor)
 }
 
-ShowFeedbackForMonitor(monitor, workspace, prefix := "Workspace") {
-    ShowWorkspaceOverlay(monitor, workspace, 0, StrUpper(prefix))
+ShowFeedbackForMonitor(monitor, workspace, *) {
+    ShowWorkspaceOverlay(monitor, workspace)
+}
+
+OpenDebugLog(*) {
+    global DEBUG_LOG_PATH
+    DebugLog("DEBUG_LOG_OPEN", "path=" DEBUG_LOG_PATH)
+    try Run('notepad.exe "' DEBUG_LOG_PATH '"')
+}
+
+ScheduleWorkspaceStateSave(*) {
+    SetTimer(SaveWorkspaceState, -250)
+}
+
+SaveWorkspaceState(*) {
+    global CurrentWorkspace, WindowWorkspace, WORKSPACE_STATE_PATH, WORKSPACE_COUNT
+    try {
+        SplitPath(WORKSPACE_STATE_PATH,, &stateDirectory)
+        DirCreate(stateDirectory)
+        contents := "IMW_STATE_V1`n"
+        Loop MonitorGetCount() {
+            monitor := A_Index
+            workspace := CurrentWorkspace.Has(monitor) ? CurrentWorkspace[monitor] : 1
+            contents .= "M`t" MonitorGetName(monitor) "`t" workspace "`n"
+        }
+        savedWindows := 0
+        for hwnd, slot in WindowWorkspace {
+            if !WinExist("ahk_id " hwnd)
+                continue
+            if slot.monitor < 1 || slot.monitor > MonitorGetCount()
+                continue
+            try pid := WinGetPID("ahk_id " hwnd)
+            catch
+                continue
+            contents .= "W`t" hwnd "`t" pid "`t" MonitorGetName(slot.monitor)
+                . "`t" slot.workspace "`n"
+            savedWindows += 1
+        }
+
+        temporaryPath := WORKSPACE_STATE_PATH ".tmp"
+        if FileExist(temporaryPath)
+            FileDelete(temporaryPath)
+        FileAppend(contents, temporaryPath, "UTF-8")
+        FileMove(temporaryPath, WORKSPACE_STATE_PATH, true)
+        DebugLog("STATE_SAVE", "path=" WORKSPACE_STATE_PATH
+            " monitors=" MonitorGetCount() " windows=" savedWindows)
+    } catch as error {
+        DebugLog("STATE_SAVE_ERROR", "message=" DebugClean(error.Message))
+    }
+}
+
+LoadWorkspaceState() {
+    global CurrentWorkspace, WindowWorkspace, WORKSPACE_STATE_PATH, WORKSPACE_COUNT
+    if !FileExist(WORKSPACE_STATE_PATH) {
+        DebugLog("STATE_LOAD", "result=missing path=" WORKSPACE_STATE_PATH)
+        return false
+    }
+
+    monitorLookup := Map()
+    Loop MonitorGetCount()
+        monitorLookup[StrLower(MonitorGetName(A_Index))] := A_Index
+
+    restoredMonitors := 0
+    restoredWindows := 0
+    rejectedWindows := 0
+    try contents := FileRead(WORKSPACE_STATE_PATH, "UTF-8")
+    catch as error {
+        DebugLog("STATE_LOAD_ERROR", "message=" DebugClean(error.Message))
+        return false
+    }
+
+    for line in StrSplit(contents, "`n", "`r") {
+        if !line || line = "IMW_STATE_V1"
+            continue
+        fields := StrSplit(line, "`t")
+        if fields.Length >= 3 && fields[1] = "M" {
+            deviceName := StrLower(fields[2])
+            try workspace := Integer(fields[3])
+            catch
+                continue
+            if monitorLookup.Has(deviceName)
+                && workspace >= 1 && workspace <= WORKSPACE_COUNT {
+                CurrentWorkspace[monitorLookup[deviceName]] := workspace
+                restoredMonitors += 1
+            }
+            continue
+        }
+        if fields.Length < 5 || fields[1] != "W"
+            continue
+
+        try {
+            hwnd := Integer(fields[2])
+            expectedPid := Integer(fields[3])
+            deviceName := StrLower(fields[4])
+            workspace := Integer(fields[5])
+        } catch {
+            rejectedWindows += 1
+            continue
+        }
+        if !monitorLookup.Has(deviceName) || workspace < 1 || workspace > WORKSPACE_COUNT
+            || !WinExist("ahk_id " hwnd) {
+            rejectedWindows += 1
+            continue
+        }
+        try actualPid := WinGetPID("ahk_id " hwnd)
+        catch {
+            rejectedWindows += 1
+            continue
+        }
+        if actualPid != expectedPid || IsIgnoredPersistedWindow(hwnd) {
+            rejectedWindows += 1
+            continue
+        }
+        monitor := monitorLookup[deviceName]
+        WindowWorkspace[hwnd] := {monitor: monitor, workspace: workspace}
+        restoredWindows += 1
+        DebugLog("STATE_WINDOW_RESTORE", "monitor=" monitor " workspace=D" workspace
+            " " DebugDescribeWindow(hwnd))
+    }
+
+    DebugLog("STATE_LOAD", "result=ok monitors=" restoredMonitors
+        " windows=" restoredWindows " rejected=" rejectedWindows
+        " path=" WORKSPACE_STATE_PATH)
+    return restoredMonitors || restoredWindows
+}
+
+IsIgnoredPersistedWindow(hwnd) {
+    try className := WinGetClass("ahk_id " hwnd)
+    catch
+        return true
+    if className = "EdgeUiInputTopWndClass" || className = "RaycastUIAccessHelper"
+        return true
+    try processName := WinGetProcessName("ahk_id " hwnd)
+    catch
+        processName := ""
+    try title := WinGetTitle("ahk_id " hwnd)
+    catch
+        title := ""
+    return StrLower(processName) = "msedgewebview2.exe" && title = "Widgets"
+}
+
+ApplyRestoredWorkspaceVisibility() {
+    global CurrentWorkspace, WindowWorkspace, HiddenByScript
+    applied := 0
+    for hwnd, slot in WindowWorkspace.Clone() {
+        if !WinExist("ahk_id " hwnd) {
+            ForgetWindow(hwnd)
+            continue
+        }
+        if !CurrentWorkspace.Has(slot.monitor)
+            continue
+        expectedVisible := slot.workspace = CurrentWorkspace[slot.monitor]
+        if expectedVisible {
+            if !IsVisible(hwnd) {
+                DebugLog("STATE_APPLY_SHOW", "current=D" CurrentWorkspace[slot.monitor]
+                    " " DebugDescribeWindow(hwnd))
+                ShowWindowFast(hwnd)
+            }
+            if HiddenByScript.Has(hwnd)
+                HiddenByScript.Delete(hwnd)
+        } else {
+            if IsVisible(hwnd) {
+                DebugLog("STATE_APPLY_HIDE", "current=D" CurrentWorkspace[slot.monitor]
+                    " assigned=D" slot.workspace " " DebugDescribeWindow(hwnd))
+                CaptureWindowSnapshot(hwnd)
+                HideWindowFast(hwnd)
+            }
+            HiddenByScript[hwnd] := true
+        }
+        applied += 1
+    }
+    DebugLog("STATE_APPLY", "windows=" applied)
+    Loop MonitorGetCount()
+        SetTimer(VerifyWorkspaceTransition.Bind(A_Index, CurrentWorkspace[A_Index], 0), -300)
+}
+
+InitializeDebugLogging() {
+    global DEBUG_LOG_PATH, DEBUG_PREVIOUS_LOG_PATH, DEBUG_MAX_BYTES, DEBUG_SESSION_ID
+    try {
+        SplitPath(DEBUG_LOG_PATH,, &logDirectory)
+        DirCreate(logDirectory)
+        if FileExist(DEBUG_LOG_PATH) && FileGetSize(DEBUG_LOG_PATH) >= DEBUG_MAX_BYTES {
+            if FileExist(DEBUG_PREVIOUS_LOG_PATH)
+                FileDelete(DEBUG_PREVIOUS_LOG_PATH)
+            FileMove(DEBUG_LOG_PATH, DEBUG_PREVIOUS_LOG_PATH, true)
+        }
+        FileAppend("`n===== SESSION " DEBUG_SESSION_ID " =====`n", DEBUG_LOG_PATH, "UTF-8")
+    }
+}
+
+DebugLog(event, details := "") {
+    global DEBUG_LOG_PATH, DEBUG_SESSION_ID
+    try {
+        timestamp := FormatTime(, "yyyy-MM-dd HH:mm:ss") "." Format("{:03}", A_MSec)
+        line := timestamp " [" DEBUG_SESSION_ID "] [" event "]"
+        if details != ""
+            line .= " " DebugClean(details)
+        FileAppend(line "`n", DEBUG_LOG_PATH, "UTF-8")
+    }
+}
+
+DebugClean(value) {
+    text := value ""
+    text := StrReplace(text, "`r", "\\r")
+    text := StrReplace(text, "`n", "\\n")
+    text := StrReplace(text, "`t", " ")
+    return text
+}
+
+FormatDebugArguments() {
+    result := "["
+    for index, argument in A_Args {
+        if index > 1
+            result .= ", "
+        result .= '"' DebugClean(argument) '"'
+    }
+    return result "]"
+}
+
+DebugDescribeWindow(hwnd) {
+    if !hwnd
+        return "hwnd=0"
+    exists := WinExist("ahk_id " hwnd) != 0
+    if !exists
+        return "hwnd=" hwnd " exists=false"
+    try title := DebugClean(WinGetTitle("ahk_id " hwnd))
+    catch
+        title := "<error>"
+    try processName := WinGetProcessName("ahk_id " hwnd)
+    catch
+        processName := "<error>"
+    try className := WinGetClass("ahk_id " hwnd)
+    catch
+        className := "<error>"
+    try minimized := WinGetMinMax("ahk_id " hwnd)
+    catch
+        minimized := "<error>"
+    try monitor := GetWindowMonitor(hwnd)
+    catch
+        monitor := "<error>"
+    quote := Chr(34)
+    return "hwnd=" hwnd " title=" quote title quote " process=" processName
+        . " class=" className " monitor=" monitor " visible=" IsVisible(hwnd)
+        . " minmax=" minimized
+}
+
+DebugWorkspaceSummary(monitor) {
+    global WindowWorkspace, HiddenByScript, WORKSPACE_COUNT
+    counts := []
+    Loop WORKSPACE_COUNT
+        counts.Push(0)
+    tracked := 0
+    hidden := 0
+    for hwnd, slot in WindowWorkspace {
+        if slot.monitor != monitor
+            continue
+        tracked += 1
+        if slot.workspace >= 1 && slot.workspace <= WORKSPACE_COUNT
+            counts[slot.workspace] += 1
+        if HiddenByScript.Has(hwnd)
+            hidden += 1
+    }
+    result := "tracked=" tracked " hidden=" hidden
+    Loop WORKSPACE_COUNT
+        result .= " D" A_Index "=" counts[A_Index]
+    return result
+}
+
+VerifyWorkspaceTransition(monitor, workspace, attempt := 0) {
+    global CurrentWorkspace, WindowWorkspace, HiddenByScript
+    mismatchCount := 0
+    mismatchDetails := ""
+    for hwnd, slot in WindowWorkspace {
+        if slot.monitor != monitor || !WinExist("ahk_id " hwnd)
+            continue
+        expectedVisible := slot.workspace = workspace
+        actualVisible := IsVisible(hwnd)
+        scriptHidden := HiddenByScript.Has(hwnd)
+        if expectedVisible != actualVisible {
+            mismatchCount += 1
+            if mismatchCount <= 12
+                mismatchDetails .= " | expected=" (expectedVisible ? "visible" : "hidden")
+                    . " assigned=D" slot.workspace " scriptHidden=" scriptHidden
+                    . " " DebugDescribeWindow(hwnd)
+        }
+    }
+    actualWorkspace := CurrentWorkspace.Has(monitor) ? "D" CurrentWorkspace[monitor] : "missing"
+    DebugLog("SWITCH_VERIFY", "attempt=" attempt " monitor=" monitor
+        " expected=D" workspace " actual=" actualWorkspace
+        " mismatches=" mismatchCount " active=" DebugDescribeWindow(WinExist("A"))
+        mismatchDetails)
+    if mismatchCount && attempt < 3
+        SetTimer(VerifyWorkspaceTransition.Bind(monitor, workspace, attempt + 1), -250)
 }
 
 ShowHelp(*) {
@@ -443,9 +1815,11 @@ ShowHelp(*) {
         "Independent Monitor Workspaces`n`n"
         . "Point the mouse at the monitor you want to control, then use:`n`n"
         . "Win+Ctrl+Left / Right   Previous or next workspace`n"
+        . "Win+Ctrl+Space          Show all workspace windows`n"
         . "Win+Ctrl+1.." WORKSPACE_COUNT "       Open a numbered workspace`n"
         . "Win+Ctrl+Shift+1.." WORKSPACE_COUNT " Move the active window`n"
         . "Win+Ctrl+Shift+Esc      Reveal everything and reset`n`n"
+        . "Move the pointer to a monitor's top-left corner and hold to open the overview.`n`n"
         . "Keep Windows itself on one native virtual desktop while using this script.",
         "Independent Monitor Workspaces",
         "Iconi"

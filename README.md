@@ -16,6 +16,7 @@ Windows virtual desktops switch every display together. This lightweight AutoHot
 - Smooth slide-and-fade workspace indicator
 - Native cursor-to-monitor detection across mixed DPI and scaling
 - Automatic support for one, two, three, four, or more connected monitors
+- Mission Control-style workspace overview with window previews
 - Safe reset when displays are connected, disconnected, docked, or rearranged
 - No background service, driver, scheduled task, registry edit, telemetry, or administrator requirement
 
@@ -51,11 +52,30 @@ Point the mouse at the monitor you want to control, then use:
 |---|---|
 | `Win+Ctrl+Left` / `Win+Ctrl+Right` | Previous / next workspace on that monitor |
 | `Ctrl+Alt+Left` / `Ctrl+Alt+Right` | Logitech-friendly previous / next workspace shortcuts |
-| `Win+Ctrl+1` ... `Win+Ctrl+2` | Open a numbered workspace on that monitor |
-| `Win+Ctrl+Shift+1` ... `Win+Ctrl+Shift+2` | Move the active window to a workspace |
+| `Win+Ctrl+Space` | Show or close the workspace overview on that monitor |
+| `Win+Ctrl+1` ... `Win+Ctrl+3` | Open a numbered workspace on that monitor |
+| `Win+Ctrl+Shift+1` ... `Win+Ctrl+Shift+3` | Move the active window to a workspace |
 | `Win+Ctrl+Shift+Esc` | Reveal every window and reset all workspace state |
 
-Two workspaces are enabled by default. Change `WORKSPACE_COUNT := 2` near the top of the script to any value from 1 to 9.
+Three workspaces are enabled by default. Change `WORKSPACE_COUNT := 3` near the top of the script to any value from 1 to 9.
+
+Workspace changes use a 340 ms directional slide with no crossfade. Moving to a higher D-number slides the current windows left and brings the next workspace in from the right; moving to a lower D-number reverses that motion. The animation uses captured window surfaces so real application positions and maximized state remain unchanged.
+
+## Workspace overview
+
+Press `Win+Ctrl+Space`, or hold the pointer in a monitor's top-left corner for half a second, to see every workspace on that monitor. The active workspace uses live window thumbnails. Inactive workspaces use snapshots captured immediately before their windows were hidden.
+
+- Click a `D1`, `D2`, or `D3` panel to switch to that workspace.
+- Click a window preview to switch to its workspace, show the `D1`, `D2`, or `D3` indicator, and focus that window.
+- Press `Esc`, click outside the panels, or press `Win+Ctrl+Space` again to close the overview.
+
+Preview capture is best effort. Protected, elevated, or specialized application windows may show an older image or only their title.
+
+## Debug log
+
+The app records workspace switching diagnostics in `%LOCALAPPDATA%\IndependentMonitorWorkspaces\debug.log`. Right-click its tray icon and select **Open debug log** to inspect or share it. The log includes window titles and process names so workspace assignments and focus failures can be identified. It rotates to `debug.previous.log` at 4 MB.
+
+Workspace assignments and each monitor's active D-number are saved in `%LOCALAPPDATA%\IndependentMonitorWorkspacesState\workspace-state.tsv`. This state survives app updates and restarts; stale windows are rejected by matching both their window handle and process ID.
 
 ## Uninstall in one command
 
