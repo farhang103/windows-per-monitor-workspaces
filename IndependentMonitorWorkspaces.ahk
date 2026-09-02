@@ -6,7 +6,7 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.7"
+APP_VERSION := "1.2.11"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
@@ -37,6 +37,7 @@ global ExternalActivationHandling := false
 global PendingExternalActivations := Map()
 global ForegroundWinEventCallback := 0
 global ForegroundWinEventHook := 0
+global TaskbarActivationShields := Map()
 global DEBUG_LOG_PATH := EnvGet("LOCALAPPDATA") "\IndependentMonitorWorkspaces\debug.log"
 global DEBUG_PREVIOUS_LOG_PATH := EnvGet("LOCALAPPDATA") "\IndependentMonitorWorkspaces\debug.previous.log"
 global DEBUG_MAX_BYTES := 4 * 1024 * 1024
@@ -44,6 +45,12 @@ global DEBUG_SESSION_ID := FormatTime(, "yyyyMMdd-HHmmss") "-" DllCall("GetCurre
 global WORKSPACE_STATE_PATH := EnvGet("LOCALAPPDATA")
     . "\IndependentMonitorWorkspacesState\workspace-state.tsv"
 global WorkspaceStatePersistenceEnabled := true
+
+; AutoHotkey starts system-DPI-aware, which virtualizes screen coordinates on
+; monitors whose scaling differs from the primary display. Keep the script's
+; single native UI thread per-monitor-v2-aware so monitor bounds, screen
+; captures, GDI buffers, and presentation windows all use physical pixels.
+global StartupPreviousDpiContext := EnablePerMonitorDpiAwareness()
 
 DetectHiddenWindows true
 SetTitleMatchMode 2
@@ -55,6 +62,7 @@ OnMessage(0x0202, HandleOverviewClick) ; WM_LBUTTONUP
 InitializeDebugLogging()
 DebugLog("STARTUP", "version=" APP_VERSION " script=" A_ScriptFullPath
     " args=" FormatDebugArguments())
+DebugLog("DPI_AWARENESS", DebugDpiAwareness())
 
 if A_Args.Length && A_Args[1] = "--preview" {
     previewMonitor := A_Args.Length >= 2 ? Integer(A_Args[2]) : MonitorGetPrimary()
@@ -126,6 +134,7 @@ Hotkey("^!Left", PreviousWorkspace)
 Hotkey("^!Right", NextWorkspace)
 Hotkey("#^+Esc", ResetAndRevealAll)
 Hotkey("#^Space", ToggleWorkspaceOverview)
+RegisterTaskbarClickHotkeys()
 SetTimer(CheckWorkspaceOverviewHotCorner, 100)
 InstallForegroundWinEventHook()
 SetTimer(CheckExternalWorkspaceActivation, 15)
@@ -208,7 +217,7 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
             " to=D" workspace " map=" DebugWorkspaceSummary(monitor))
 
         if externalActivatedHwnd
-            PrepareExternalActivationForSwitch(
+            PrepareShieldedExternalActivation(
                 externalActivatedHwnd, monitor, workspace)
 
         ; Discover newly opened windows before changing what is visible.
@@ -234,6 +243,8 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
         animationDuration := rapid ? RAPID_WORKSPACE_SLIDE_MS : WORKSPACE_SLIDE_MS
         animation := BeginWorkspaceSlideAnimation(
             monitor, oldWorkspace, workspace, direction, animationDuration)
+        if externalActivatedHwnd && animation
+            CancelTaskbarActivationShield(monitor, 0, "animation-handoff")
 
         ; First hide every non-target window. Incoming windows remain hidden
         ; until their captured surfaces finish sliding into place.
@@ -280,6 +291,8 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
         SetTimer(VerifyWorkspaceTransition.Bind(monitor, workspace, 0), -200)
     } finally {
         EndWorkspaceSlideAnimation(animation)
+        if externalActivatedHwnd
+            CancelTaskbarActivationShield(monitor, 0, "switch-finalize")
         if WorkspaceSlideSkipRequests.Has(monitor)
             WorkspaceSlideSkipRequests.Delete(monitor)
         Switching := false
@@ -659,6 +672,8 @@ PaintWorkspaceOverview(wParam, lParam, msg, hwnd) {
         PaintWorkspaceSlide(hwnd)
         return 0
     }
+    if PaintTaskbarActivationShield(hwnd)
+        return 0
     if !WorkspaceOverview || !WorkspaceOverview.hwnd || hwnd != WorkspaceOverview.hwnd
         return
 
@@ -684,9 +699,13 @@ PaintWorkspaceOverview(wParam, lParam, msg, hwnd) {
 }
 
 HandleWorkspaceSlideEraseBackground(wParam, lParam, msg, hwnd) {
-    global WorkspaceSlideAnimations
+    global WorkspaceSlideAnimations, TaskbarActivationShields
     if WorkspaceSlideAnimations.Has(hwnd)
         return 1
+    for monitor, state in TaskbarActivationShields {
+        if state.hwnd = hwnd
+            return 1
+    }
 }
 
 DrawOverviewSnapshot(destinationDc, snapshot, rect) {
@@ -852,6 +871,207 @@ ActivateOverviewWindow(hwnd, monitor, workspace, attempt := 0) {
             hwnd, monitor, workspace, attempt + 1), -120)
 }
 
+IsPointerOverTaskbarAppList(*) {
+    MouseGetPos(&x, &y)
+    for hwnd in WinGetList("ahk_class MSTaskListWClass") {
+        if !IsVisible(hwnd)
+            continue
+        rect := Buffer(16, 0)
+        if !DllCall("GetWindowRect", "ptr", hwnd, "ptr", rect.Ptr)
+            continue
+        if x >= NumGet(rect, 0, "int") && x < NumGet(rect, 8, "int")
+            && y >= NumGet(rect, 4, "int") && y < NumGet(rect, 12, "int")
+            return true
+    }
+    return false
+}
+
+RegisterTaskbarClickHotkeys() {
+    HotIf(IsPointerOverTaskbarAppList)
+    Hotkey("$LButton", HandleTaskbarAppMouseDown)
+    Hotkey("$LButton Up", HandleTaskbarAppMouseUp)
+    HotIf()
+}
+
+HandleTaskbarAppMouseDown(*) {
+    BeginTaskbarActivationShield(GetMonitorUnderMouse())
+    SendEvent("{LButton Down}")
+}
+
+HandleTaskbarAppMouseUp(*) {
+    SendEvent("{LButton Up}")
+    SetTimer(CancelUnclaimedTaskbarActivationShields, -180)
+}
+
+BeginTaskbarActivationShield(monitor) {
+    global CurrentWorkspace, Switching, WorkspaceOverview
+    global ExternalActivationHandling, TaskbarActivationShields
+    if Switching || WorkspaceOverview || ExternalActivationHandling
+        return false
+    EnsureMonitorState()
+    CancelTaskbarActivationShield(monitor, 0, "replace")
+
+    workspace := CurrentWorkspace[monitor]
+    captureStarted := A_TickCount
+    frame := CaptureMonitorWorkspaceFrame(monitor, workspace)
+    if !frame
+        return false
+    bitmap := DuplicateWorkspaceBitmap(frame.bitmap, frame.width, frame.height)
+    if !bitmap
+        return false
+
+    MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
+    layer := CreatePhysicalPixelLayer()
+    state := {
+        gui: layer, hwnd: layer.Hwnd, monitor: monitor, workspace: workspace,
+        left: left, top: top, width: right - left, height: bottom - top,
+        bitmap: bitmap, claimed: false, startedAt: A_TickCount
+    }
+    TaskbarActivationShields[monitor] := state
+    ; Position the hidden HWND in physical pixels first. Gui.Show() interprets
+    ; dimensions through the GUI DPI and can expose one scaled frame before a
+    ; corrective SetWindowPos on mixed-scaling displays.
+    try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", -1,
+        "int", left, "int", top, "int", state.width, "int", state.height,
+        "uint", 0x0010)
+    try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", -1,
+        "int", left, "int", top, "int", state.width, "int", state.height,
+        "uint", 0x0050)
+    PresentTaskbarActivationShield(state)
+    try DllCall("dwmapi\DwmFlush")
+    DebugLog("TASKBAR_SHIELD_BEGIN", "monitor=" monitor
+        " workspace=D" workspace " hwnd=" state.hwnd
+        " resolution=" state.width "x" state.height
+        " geometry=" DebugWindowRenderGeometry(state.hwnd)
+        " preparationMs=" (A_TickCount - captureStarted))
+    SetTimer(CancelTaskbarActivationShield.Bind(
+        monitor, state.hwnd, "timeout"), -900)
+    return true
+}
+
+DuplicateWorkspaceBitmap(sourceBitmap, width, height) {
+    screenDc := DllCall("GetDC", "ptr", 0, "ptr")
+    sourceDc := screenDc ? DllCall("CreateCompatibleDC", "ptr", screenDc, "ptr") : 0
+    destinationDc := screenDc ? DllCall("CreateCompatibleDC", "ptr", screenDc, "ptr") : 0
+    bitmap := screenDc ? DllCall("CreateCompatibleBitmap", "ptr", screenDc,
+        "int", width, "int", height, "ptr") : 0
+    if !screenDc || !sourceDc || !destinationDc || !bitmap {
+        if bitmap
+            DllCall("DeleteObject", "ptr", bitmap)
+        if sourceDc
+            DllCall("DeleteDC", "ptr", sourceDc)
+        if destinationDc
+            DllCall("DeleteDC", "ptr", destinationDc)
+        if screenDc
+            DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
+        return 0
+    }
+    oldSource := DllCall("SelectObject", "ptr", sourceDc, "ptr", sourceBitmap, "ptr")
+    oldDestination := DllCall("SelectObject", "ptr", destinationDc, "ptr", bitmap, "ptr")
+    copied := DllCall("BitBlt", "ptr", destinationDc,
+        "int", 0, "int", 0, "int", width, "int", height,
+        "ptr", sourceDc, "int", 0, "int", 0, "uint", 0x00CC0020, "int")
+    DllCall("SelectObject", "ptr", sourceDc, "ptr", oldSource)
+    DllCall("SelectObject", "ptr", destinationDc, "ptr", oldDestination)
+    DllCall("DeleteDC", "ptr", sourceDc)
+    DllCall("DeleteDC", "ptr", destinationDc)
+    DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
+    if !copied {
+        DllCall("DeleteObject", "ptr", bitmap)
+        return 0
+    }
+    return bitmap
+}
+
+PresentTaskbarActivationShield(state, destinationDc := 0) {
+    sourceDc := DllCall("CreateCompatibleDC", "ptr", destinationDc ? destinationDc : 0, "ptr")
+    if !sourceDc
+        return false
+    oldBitmap := DllCall("SelectObject", "ptr", sourceDc, "ptr", state.bitmap, "ptr")
+    releaseDestination := false
+    if !destinationDc {
+        destinationDc := DllCall("GetDC", "ptr", state.hwnd, "ptr")
+        releaseDestination := true
+    }
+    copied := destinationDc ? DllCall("BitBlt", "ptr", destinationDc,
+        "int", 0, "int", 0, "int", state.width, "int", state.height,
+        "ptr", sourceDc, "int", 0, "int", 0, "uint", 0x00CC0020, "int") : 0
+    DllCall("SelectObject", "ptr", sourceDc, "ptr", oldBitmap)
+    DllCall("DeleteDC", "ptr", sourceDc)
+    if releaseDestination && destinationDc
+        DllCall("ReleaseDC", "ptr", state.hwnd, "ptr", destinationDc)
+    return copied != 0
+}
+
+PaintTaskbarActivationShield(hwnd) {
+    global TaskbarActivationShields
+    for monitor, state in TaskbarActivationShields {
+        if state.hwnd != hwnd
+            continue
+        paint := Buffer(72, 0)
+        hdc := DllCall("BeginPaint", "ptr", hwnd, "ptr", paint.Ptr, "ptr")
+        if hdc {
+            PresentTaskbarActivationShield(state, hdc)
+            DllCall("EndPaint", "ptr", hwnd, "ptr", paint.Ptr)
+        }
+        return true
+    }
+    return false
+}
+
+CancelUnclaimedTaskbarActivationShields(*) {
+    global TaskbarActivationShields
+    for monitor, state in TaskbarActivationShields.Clone() {
+        if !state.claimed
+            CancelTaskbarActivationShield(monitor, state.hwnd, "unclaimed")
+    }
+}
+
+CancelTaskbarActivationShield(monitor, expectedHwnd := 0, reason := "cancel", *) {
+    global TaskbarActivationShields
+    if !TaskbarActivationShields.Has(monitor)
+        return
+    state := TaskbarActivationShields[monitor]
+    if expectedHwnd && state.hwnd != expectedHwnd
+        return
+    TaskbarActivationShields.Delete(monitor)
+    try state.gui.Destroy()
+    if state.bitmap
+        try DllCall("DeleteObject", "ptr", state.bitmap)
+    DebugLog("TASKBAR_SHIELD_END", "monitor=" monitor
+        " workspace=D" state.workspace " reason=" reason
+        " elapsedMs=" (A_TickCount - state.startedAt))
+}
+
+ClearTaskbarActivationShields(reason := "clear") {
+    global TaskbarActivationShields
+    for monitor in TaskbarActivationShields.Clone()
+        CancelTaskbarActivationShield(monitor, 0, reason)
+}
+
+PrepareShieldedExternalActivation(hwnd, monitor, workspace) {
+    global WindowWorkspace, HiddenByScript, TaskbarActivationShields
+    if !TaskbarActivationShields.Has(monitor)
+        return false
+    if !WinExist("ahk_id " hwnd) || !WindowWorkspace.Has(hwnd)
+        return false
+    slot := WindowWorkspace[hwnd]
+    if slot.monitor != monitor || slot.workspace != workspace
+        return false
+
+    startedAt := A_TickCount
+    HiddenByScript[hwnd] := true
+    if IsVisible(hwnd)
+        HideWindowFast(hwnd)
+    while IsVisible(hwnd) && A_TickCount - startedAt < 120
+        Sleep(4)
+    hidden := !IsVisible(hwnd)
+    DebugLog("TASKBAR_SHIELD_PREPARE", "monitor=" monitor
+        " workspace=D" workspace " hidden=" hidden
+        " elapsedMs=" (A_TickCount - startedAt) " hwnd=" hwnd)
+    return hidden
+}
+
 CheckExternalWorkspaceActivation(*) {
     global Switching, ExternalActivationHandling, WorkspaceOverview
     if Switching || ExternalActivationHandling || WorkspaceOverview
@@ -914,7 +1134,10 @@ HandleForegroundWinEvent(hook, event, foregroundHwnd, objectId,
 
 QueueExternalWorkspaceActivation(hwnd, source, eventTime := 0) {
     global CurrentWorkspace, WindowWorkspace, HiddenByScript
-    global PendingExternalActivations
+    global PendingExternalActivations, TaskbarActivationShields
+    global ExternalActivationHandling
+    if ExternalActivationHandling
+        return true
     if !hwnd || !WindowWorkspace.Has(hwnd)
         return false
 
@@ -926,22 +1149,27 @@ QueueExternalWorkspaceActivation(hwnd, source, eventTime := 0) {
         return false
     if PendingExternalActivations.Has(hwnd)
         return true
+    if TaskbarActivationShields.Has(slot.monitor) {
+        shield := TaskbarActivationShields[slot.monitor]
+        if shield.workspace = current
+            shield.claimed := true
+    }
 
-    ; Hide immediately inside the foreground-event callback. ShowWindowAsync
-    ; posts to the app's UI thread before DWM normally has time to present the
-    ; taskbar-forced frame on the wrong workspace.
+    ; Windows has already made this app visible before it sends either the
+    ; foreground event or the polling fallback. Keep that frame in place and
+    ; adopt its assigned workspace atomically; hiding it here would cause a
+    ; visible reopen followed by a second slide.
     detectedAt := A_TickCount
     wasVisible := IsVisible(hwnd)
-    HiddenByScript[hwnd] := true
-    try hideResult := DllCall("ShowWindowAsync", "ptr", hwnd, "int", 0)
-    catch
-        hideResult := 0
     PendingExternalActivations[hwnd] := {
         source: source, eventTime: eventTime, queuedAt: detectedAt
     }
+    shielded := TaskbarActivationShields.Has(slot.monitor)
+        && TaskbarActivationShields[slot.monitor].claimed
     DebugLog("EXTERNAL_ACTIVATION_INTERCEPT", "source=" source
         " eventTime=" eventTime " detectedAt=" detectedAt
-        " wasVisible=" wasVisible " hideResult=" hideResult
+        " wasVisible=" wasVisible " action="
+        (shielded ? "shielded-slide" : "adopt-without-slide")
         " monitor=" slot.monitor " current=D" current
         " assigned=D" slot.workspace " hwnd=" hwnd)
     SetTimer(ProcessPendingExternalActivations, -1)
@@ -951,7 +1179,7 @@ QueueExternalWorkspaceActivation(hwnd, source, eventTime := 0) {
 ProcessPendingExternalActivations(*) {
     global CurrentWorkspace, WindowWorkspace, HiddenByScript
     global Switching, WorkspaceOverview, ExternalActivationHandling
-    global PendingExternalActivations
+    global PendingExternalActivations, TaskbarActivationShields
     if !PendingExternalActivations.Count
         return
     if ExternalActivationHandling || Switching || WorkspaceOverview {
@@ -989,16 +1217,22 @@ ProcessPendingExternalActivations(*) {
                 " current=D" current " assigned=D" slot.workspace
                 " scriptHidden=" HiddenByScript.Has(hwnd) " " DebugDescribeWindow(hwnd))
 
-            ; The exact taskbar-selected app becomes the remembered top window
-            ; of its workspace, not whichever sibling responds last.
-            PromoteWorkspaceWindow(slot.monitor, slot.workspace, hwnd)
-            InvalidateWorkspaceFrame(slot.monitor, slot.workspace)
-            direction := slot.workspace > current ? 1 : -1
-            switched := SwitchToWorkspaceOnMonitor(
-                slot.workspace, slot.monitor, direction, false, hwnd)
-            committed := switched && CurrentWorkspace.Has(slot.monitor)
-                && CurrentWorkspace[slot.monitor] = slot.workspace
-            DebugLog("EXTERNAL_ACTIVATION_SWITCH", "switched=" switched
+            shielded := TaskbarActivationShields.Has(slot.monitor)
+                && TaskbarActivationShields[slot.monitor].claimed
+            if shielded {
+                PromoteWorkspaceWindow(slot.monitor, slot.workspace, hwnd)
+                InvalidateWorkspaceFrame(slot.monitor, slot.workspace)
+                direction := slot.workspace > current ? 1 : -1
+                switched := SwitchToWorkspaceOnMonitor(
+                    slot.workspace, slot.monitor, direction, false, hwnd)
+                committed := switched && CurrentWorkspace.Has(slot.monitor)
+                    && CurrentWorkspace[slot.monitor] = slot.workspace
+            } else {
+                committed := AdoptExternallyActivatedWorkspace(
+                    hwnd, slot.monitor, slot.workspace)
+            }
+            DebugLog("EXTERNAL_ACTIVATION_SWITCH", "mode="
+                (shielded ? "shielded-slide" : "instant-adopt")
                 " committed=" committed " monitor=" slot.monitor
                 " from=D" current " to=D" slot.workspace
                 " source=" request.source " " DebugDescribeWindow(hwnd))
@@ -1017,6 +1251,124 @@ ProcessPendingExternalActivations(*) {
         SetTimer(ProcessPendingExternalActivations, -1)
 }
 
+AdoptExternallyActivatedWorkspace(hwnd, monitor, workspace) {
+    global CurrentWorkspace, RequestedWorkspace, WindowWorkspace, HiddenByScript
+    global Switching, SwitchingMonitor, PendingWorkspaceSwitches, WorkspaceOverview
+
+    if Switching || !CurrentWorkspace.Has(monitor)
+        return false
+    oldWorkspace := CurrentWorkspace[monitor]
+    if oldWorkspace = workspace
+        return true
+
+    startedAt := A_TickCount
+    Switching := true
+    SwitchingMonitor := monitor
+    try {
+        if WorkspaceOverview
+            CloseWorkspaceOverview(false)
+        RememberWorkspaceWindowOrder(monitor, oldWorkspace)
+        PromoteWorkspaceWindow(monitor, workspace, hwnd)
+        InvalidateWorkspaceFrame(monitor, oldWorkspace)
+        InvalidateWorkspaceFrame(monitor, workspace)
+
+        hiddenOutgoing := 0
+        requestedIncoming := 0
+        for candidate, slot in WindowWorkspace.Clone() {
+            if slot.monitor != monitor
+                continue
+            if !WinExist("ahk_id " candidate) {
+                ForgetWindow(candidate)
+                continue
+            }
+            if slot.workspace != workspace {
+                if IsVisible(candidate) {
+                    HideWindowFast(candidate)
+                    HiddenByScript[candidate] := true
+                    hiddenOutgoing += 1
+                }
+                continue
+            }
+
+            ; The taskbar-selected window is already the frame the user sees.
+            ; Leave it completely untouched. Reveal workspace siblings behind
+            ; it without waiting or replaying a slide.
+            if candidate = hwnd && IsVisible(candidate) {
+                if HiddenByScript.Has(candidate)
+                    HiddenByScript.Delete(candidate)
+                continue
+            }
+            if HiddenByScript.Has(candidate) {
+                ShowWindowFast(candidate)
+                requestedIncoming += 1
+            }
+        }
+
+        CurrentWorkspace[monitor] := workspace
+        RequestedWorkspace[monitor] := workspace
+        RaiseWorkspacePriorityWindow(hwnd)
+        ShowWorkspaceOverlay(monitor, workspace,
+            workspace > oldWorkspace ? 1 : -1)
+        ScheduleWorkspaceStateSave()
+        SetTimer(FinalizeAdoptedWorkspace.Bind(
+            hwnd, monitor, workspace, 0), -35)
+        SetTimer(VerifyWorkspaceTransition.Bind(monitor, workspace, 0), -200)
+        DebugLog("EXTERNAL_ADOPT_COMMIT", "monitor=" monitor
+            " from=D" oldWorkspace " to=D" workspace
+            " elapsedMs=" (A_TickCount - startedAt)
+            " hiddenOutgoing=" hiddenOutgoing
+            " requestedIncoming=" requestedIncoming
+            " selected=" DebugDescribeWindow(hwnd))
+        return true
+    } finally {
+        Switching := false
+        SwitchingMonitor := 0
+        if PendingWorkspaceSwitches.Count
+            SetTimer(ProcessPendingWorkspaceSwitches, -1)
+    }
+}
+
+FinalizeAdoptedWorkspace(hwnd, monitor, workspace, attempt := 0) {
+    global CurrentWorkspace, WindowWorkspace, HiddenByScript
+    if !CurrentWorkspace.Has(monitor) || CurrentWorkspace[monitor] != workspace
+        return
+
+    pending := 0
+    for candidate, slot in WindowWorkspace.Clone() {
+        if slot.monitor != monitor || slot.workspace != workspace
+            continue
+        if !WinExist("ahk_id " candidate) {
+            ForgetWindow(candidate)
+            continue
+        }
+        if IsVisible(candidate) {
+            if HiddenByScript.Has(candidate)
+                HiddenByScript.Delete(candidate)
+        } else if HiddenByScript.Has(candidate) {
+            ShowWindowFast(candidate)
+            pending += 1
+        }
+    }
+    RestoreWorkspaceWindowOrder(monitor, workspace)
+    RaiseWorkspacePriorityWindow(hwnd)
+    DebugLog("EXTERNAL_ADOPT_FINALIZE", "attempt=" attempt
+        " monitor=" monitor " workspace=D" workspace
+        " pending=" pending " selectedVisible=" IsVisible(hwnd))
+    if pending && attempt < 5
+        SetTimer(FinalizeAdoptedWorkspace.Bind(
+            hwnd, monitor, workspace, attempt + 1), -50)
+}
+
+RaiseWorkspacePriorityWindow(hwnd) {
+    if !hwnd || !WinExist("ahk_id " hwnd) || !IsVisible(hwnd)
+        return false
+    try return DllCall("SetWindowPos", "ptr", hwnd, "ptr", 0,
+        "int", 0, "int", 0, "int", 0, "int", 0,
+        "uint", 0x0013, "int") != 0 ; NOMOVE|NOSIZE|NOACTIVATE
+    catch
+        return false
+}
+
 ResolveTrackedWorkspaceWindow(hwnd) {
     global WindowWorkspace
     if !hwnd
@@ -1031,29 +1383,6 @@ ResolveTrackedWorkspaceWindow(hwnd) {
             return ancestor
     }
     return 0
-}
-
-PrepareExternalActivationForSwitch(hwnd, monitor, workspace) {
-    global WindowWorkspace, HiddenByScript
-    if !WinExist("ahk_id " hwnd) || !WindowWorkspace.Has(hwnd)
-        return false
-    slot := WindowWorkspace[hwnd]
-    if slot.monitor != monitor || slot.workspace != workspace
-        return false
-
-    startedAt := A_TickCount
-    wasVisible := IsVisible(hwnd)
-    HiddenByScript[hwnd] := true
-    if wasVisible
-        HideWindowFast(hwnd)
-    while IsVisible(hwnd) && A_TickCount - startedAt < 120
-        Sleep(6)
-    hidden := !IsVisible(hwnd)
-    DebugLog("EXTERNAL_ACTIVATION_PREPARE", "monitor=" monitor
-        " workspace=D" workspace " wasVisible=" wasVisible
-        " hidden=" hidden " elapsedMs=" (A_TickCount - startedAt)
-        " " DebugDescribeWindow(hwnd))
-    return hidden
 }
 
 HandleOverviewEscape(*) {
@@ -1134,6 +1463,65 @@ GetMonitorDpi(monitor) {
             dpiX := A_ScreenDPI
     }
     return dpiX > 0 ? dpiX : A_ScreenDPI
+}
+
+EnablePerMonitorDpiAwareness() {
+    previousContext := 0
+    try previousContext := DllCall(
+        "SetThreadDpiAwarenessContext", "ptr", -4, "ptr")
+    return previousContext
+}
+
+DebugDpiAwareness() {
+    context := 0
+    awareness := -1
+    try context := DllCall("GetThreadDpiAwarenessContext", "ptr")
+    if context
+        try awareness := DllCall(
+            "GetAwarenessFromDpiAwarenessContext", "ptr", context, "int")
+    return "threadContext=" context " awareness=" awareness
+        . " screenDpi=" A_ScreenDPI
+}
+
+CreatePhysicalPixelLayer() {
+    ; AHK's process DPI mode can still let a newly-created GUI pass through a
+    ; scaled intermediate size. Create the native HWND under per-monitor-v2 so
+    ; every subsequent SetWindowPos value is interpreted as a physical pixel.
+    previousContext := 0
+    try previousContext := DllCall("SetThreadDpiAwarenessContext", "ptr", -4, "ptr")
+    try {
+        layer := Gui("+AlwaysOnTop -Caption -Border +ToolWindow +E0x20 -DPIScale")
+        ; Force HWND creation before restoring the caller's DPI context.
+        layerHwnd := layer.Hwnd
+    } finally {
+        if previousContext
+            try DllCall("SetThreadDpiAwarenessContext", "ptr", previousContext, "ptr")
+    }
+    layer.BackColor := "111827"
+    layer.MarginX := 0
+    layer.MarginY := 0
+    return layer
+}
+
+DebugWindowRenderGeometry(hwnd) {
+    clientRect := Buffer(16, 0)
+    windowRect := Buffer(16, 0)
+    if !DllCall("GetClientRect", "ptr", hwnd, "ptr", clientRect.Ptr)
+        return "unavailable"
+    clientWidth := NumGet(clientRect, 8, "int") - NumGet(clientRect, 0, "int")
+    clientHeight := NumGet(clientRect, 12, "int") - NumGet(clientRect, 4, "int")
+    windowDetails := "window=unavailable"
+    if DllCall("GetWindowRect", "ptr", hwnd, "ptr", windowRect.Ptr) {
+        windowDetails := "window=" NumGet(windowRect, 0, "int")
+            . "," NumGet(windowRect, 4, "int")
+            . "," NumGet(windowRect, 8, "int")
+            . "," NumGet(windowRect, 12, "int")
+    }
+    try windowDpi := DllCall("GetDpiForWindow", "ptr", hwnd, "uint")
+    catch
+        windowDpi := 0
+    return "client=" clientWidth "x" clientHeight " " windowDetails
+        . " windowDpi=" windowDpi
 }
 
 SetupWorkspaceOverviewPreview(monitor) {
@@ -1277,6 +1665,7 @@ SetupTaskbarActivationPreview(monitor) {
         }
     }
 
+    RegisterTaskbarClickHotkeys()
     InstallForegroundWinEventHook()
     SetTimer(CheckExternalWorkspaceActivation, 15)
     SetTimer(SwitchToWorkspaceOnMonitor.Bind(3, monitor, 1), -250)
@@ -1286,6 +1675,7 @@ SetupTaskbarActivationPreview(monitor) {
 
 SimulateTaskbarWorkspaceActivation(monitor) {
     global OverviewPreviewWindows
+    BeginTaskbarActivationShield(monitor)
     for item in OverviewPreviewWindows {
         if item.label != "D1 Codex"
             continue
@@ -1870,6 +2260,7 @@ RestoreAllWindows(*) {
 HandleAppExit(*) {
     DebugLog("APP_EXIT", "begin")
     RemoveForegroundWinEventHook()
+    ClearTaskbarActivationShields("app-exit")
     SaveWorkspaceState()
     CloseWorkspaceOverview(false)
     RestoreAllWindows()
@@ -1883,6 +2274,7 @@ ResetAndRevealAll(*) {
     global PendingWorkspaceSwitches, WorkspaceSlideSkipRequests
     global WorkspaceWindowOrders, PendingExternalActivations
     DebugLog("RESET", "begin")
+    ClearTaskbarActivationShields("reset")
     CloseWorkspaceOverview(false)
     RestoreAllWindows()
     WindowWorkspace.Clear()
@@ -1929,10 +2321,7 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
         return false
     }
 
-    layer := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20 -DPIScale")
-    layer.BackColor := "111827"
-    layer.MarginX := 0
-    layer.MarginY := 0
+    layer := CreatePhysicalPixelLayer()
     state := {
         gui: layer, hwnd: 0, monitor: monitor,
         left: left, top: top, width: width, height: height,
@@ -1944,6 +2333,12 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
     }
 
     state.hwnd := layer.Hwnd
+    ; Size the still-hidden layer in physical pixels. Never use Gui.Show here:
+    ; it can present a DPI-scaled intermediate frame before SetWindowPos fixes
+    ; the dimensions, which looks like a zoom immediately before the slide.
+    try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", -1,
+        "int", left, "int", top, "int", width, "int", height,
+        "uint", 0x0010)
     if !InitializeWorkspaceSlideBackBuffer(state) {
         try layer.Destroy()
         DebugLog("SLIDE_SKIP", "reason=back-buffer-failed monitor=" monitor
@@ -1951,7 +2346,6 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
         return false
     }
     WorkspaceSlideAnimations[state.hwnd] := state
-    layer.Show("NA x" left " y" top " w" width " h" height)
     try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", -1,
         "int", left, "int", top, "int", width, "int", height,
         "uint", 0x0050)
@@ -1961,6 +2355,7 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
         " to=D" newWorkspace " direction=" direction
         " mode=double-buffered-bitblt durationMs=" state.duration
         " resolution=" width "x" height " dpi=" GetMonitorDpi(monitor)
+        " geometry=" DebugWindowRenderGeometry(state.hwnd)
         " outgoingCaptureMs=" outgoingCaptureMs
         " incomingCached=" incomingWasCached
         " incomingPreparationMs=" incomingPreparationMs

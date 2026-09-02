@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.2.11 - 2026-09-01
+
+- Moved the complete workspace engine into per-monitor-v2 DPI awareness instead of applying it only to animation windows
+- Unified monitor bounds, screen capture, GDI back buffers, and presentation surfaces in physical-pixel coordinates
+- Added startup DPI-context diagnostics to distinguish each monitor's actual 96, 120, or 168 DPI rendering path
+
+## 1.2.10 - 2026-09-01
+
+- Created slide and taskbar-shield windows under per-monitor-v2 DPI awareness
+- Sized animation surfaces while hidden with native physical-pixel coordinates, eliminating the scaled frame that appeared as a zoom before switching
+- Added client-area, window-bounds, and window-DPI diagnostics for every slide and taskbar shield
+
+## 1.2.9 - 2026-09-01
+
+- Intercepted mouse clicks only within Windows taskbar app-button controls before Explorer activates the selected app
+- Captured and displayed the current workspace before forwarding the click, preventing the selected app from flashing on the wrong D-number
+- Handed the frozen pre-click frame directly into the standard directional workspace animation
+- Restored smooth taskbar-triggered D3-to-D1 slides while retaining instant adoption as a fallback for non-taskbar activation
+
+## 1.2.8 - 2026-09-01
+
+- Replaced taskbar-triggered slide replay with an instant logical workspace adoption
+- Kept the taskbar-selected app continuously visible instead of hiding and reopening it
+- Updated outgoing and incoming window groups behind the selected app, then restored its top position
+- Removed all external-activation slide frames to eliminate the visible “open here, then switch there” sequence
+
 ## 1.2.7 - 2026-09-01
 
 - Replaced timer-only taskbar detection with a native Windows foreground-event hook

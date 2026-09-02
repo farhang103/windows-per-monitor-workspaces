@@ -59,13 +59,13 @@ Point the mouse at the monitor you want to control, then use:
 
 Three workspaces are enabled by default. Change `WORKSPACE_COUNT := 3` near the top of the script to any value from 1 to 9.
 
-Workspace changes use a 340 ms directional slide with no crossfade. Moving to a higher D-number slides the current workspace left and brings the next one in from the right; moving to a lower D-number reverses that motion. Two opaque, monitor-sized workspace frames are composed at the monitor's physical resolution in a persistent off-screen buffer and presented as one Desktop Window Manager-synchronized surface. Their edges remain pixel-locked, preventing wallpaper gaps, erase flicker, or DPI rescaling while real application positions and maximized state remain unchanged.
+Workspace changes use a 340 ms directional slide with no crossfade. Moving to a higher D-number slides the current workspace left and brings the next one in from the right; moving to a lower D-number reverses that motion. Two opaque, monitor-sized workspace frames are composed at the monitor's physical resolution in a persistent off-screen buffer and presented as one Desktop Window Manager-synchronized surface. The surface is created in per-monitor-v2 DPI mode and sized while hidden with physical-pixel coordinates, so no scaled or zoomed frame appears before the slide. Its edges remain pixel-locked, preventing wallpaper gaps, erase flicker, or DPI rescaling while real application positions and maximized state remain unchanged.
 
 The completed animation frame stays in place until every incoming app is visible. Each workspace also remembers its full top-to-bottom window stack, so returning to a workspace restores all of its apps with the same overlapping or maximized app on top instead of whichever app responds first.
 
 You can press the switching shortcuts repeatedly without waiting for an animation to finish. Additional input completes the active visual frame immediately, coalesces to the latest requested D-number, and uses a shorter 190 ms slide for the queued destination.
 
-Clicking an app on the Windows taskbar also follows its workspace assignment. A native Windows foreground-event hook intercepts an app belonging to another D-number before its premature frame is presented on the current workspace. The utility then performs the real workspace switch, displays the correct D indicator, and focuses the selected app. The next previous/next shortcut therefore continues from that workspace instead of jumping back to it.
+Clicking an app on the Windows taskbar also follows its workspace assignment. The utility intercepts clicks only within the taskbar's app-button area, freezes the current workspace before forwarding the click to Explorer, and hands that exact frame into the standard directional slide when the app belongs to another D-number. This prevents the app from flashing on the current workspace while preserving the same smooth D3-to-D1 motion used by the hotkeys. The correct D indicator appears, and the next previous/next shortcut continues from that workspace instead of jumping back to it. Non-taskbar activation retains an instant no-reopen fallback because Windows may reveal those windows before notifying other software.
 
 ## Workspace overview
 
@@ -111,7 +111,7 @@ The same checksum and syntax validation are applied to offline files.
 
 Windows exposes one active native virtual desktop across the full display topology. This utility stays on one native Windows desktop and maintains lightweight window groups for each physical monitor. Switching a monitor sends asynchronous show/hide requests only to windows assigned to that monitor.
 
-Monitor targeting uses the native Windows `HMONITOR` device under the physical cursor instead of comparing logical screen coordinates. This avoids the common wrong-monitor problem on displays with different scaling factors.
+Monitor targeting uses the native Windows `HMONITOR` device under the physical cursor instead of comparing logical screen coordinates. The entire engine runs per-monitor-v2 DPI-aware, keeping monitor bounds, captures, buffers, and animation windows in one physical-pixel coordinate space. This avoids wrong-monitor selection and rendering rescale artifacts on displays with different scaling factors.
 
 Display count is dynamic. One monitor works like a normal workspace switcher; additional monitors receive independent state automatically. A Windows display-topology notification triggers a safe reveal-and-reset after docking, unplugging, rearranging, or resolution changes.
 
