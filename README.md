@@ -28,7 +28,7 @@ Open PowerShell and run:
 irm https://raw.githubusercontent.com/Allaa-boutaleb/windows-per-monitor-workspaces/main/install.ps1 | iex
 ~~~
 
-That is the entire setup. The installer downloads the readable workspace script and an isolated portable AutoHotkey v2 runtime into `%LOCALAPPDATA%\IndependentMonitorWorkspaces`, creates a normal per-user Startup shortcut, and launches it.
+That is the entire setup. The installer downloads the readable workspace script and an isolated portable AutoHotkey v2 runtime into `%LOCALAPPDATA%\IndependentMonitorWorkspaces`, creates a normal per-user Startup shortcut plus a Start Menu recovery shortcut, and launches it. The installer resolves the actual on-disk paths when run from a packaged app, so Windows Explorer can still launch recovery through redirected local storage.
 
 You do not need AutoHotkey, `winget`, administrator access, or anything preinstalled. The installer does not modify `PATH` or install AutoHotkey system-wide.
 
@@ -55,15 +55,21 @@ Point the mouse at the monitor you want to control, then use:
 | `Win+Ctrl+Space` | Show or close the workspace overview on that monitor |
 | `Win+Ctrl+1` ... `Win+Ctrl+3` | Open a numbered workspace on that monitor |
 | `Win+Ctrl+Shift+1` ... `Win+Ctrl+Shift+3` | Move the active window to a workspace |
+| `Win+Ctrl+Shift+R` | Restart the workspace engine without clearing assignments |
+| `Ctrl+Alt+Shift+R` | Launch recovery when the workspace engine is no longer running |
 | `Win+Ctrl+Shift+Esc` | Reveal every window and reset all workspace state |
 
 Three workspaces are enabled by default. Change `WORKSPACE_COUNT := 3` near the top of the script to any value from 1 to 9.
+
+Previous/next navigation has hard boundaries: moving right stops at the highest D-number, and moving left stops at D1. It never wraps directly from D3 to D1 or from D1 to D3.
 
 Workspace changes use a 340 ms directional slide with no crossfade. Moving to a higher D-number slides the current workspace left and brings the next one in from the right; moving to a lower D-number reverses that motion. Two opaque, monitor-sized workspace frames are composed at the monitor's physical resolution in a persistent off-screen buffer and presented as one Desktop Window Manager-synchronized surface. The surface is created in per-monitor-v2 DPI mode and sized while hidden with physical-pixel coordinates, so no scaled or zoomed frame appears before the slide. Its edges remain pixel-locked, preventing wallpaper gaps, erase flicker, or DPI rescaling while real application positions and maximized state remain unchanged.
 
 The completed animation frame stays in place until every incoming app is visible. Each workspace also remembers its full top-to-bottom window stack, so returning to a workspace restores all of its apps with the same overlapping or maximized app on top instead of whichever app responds first.
 
 You can press the switching shortcuts repeatedly without waiting for an animation to finish. Additional input completes the active visual frame immediately, coalesces to the latest requested D-number, and uses a shorter 190 ms slide for the queued destination.
+
+A watchdog monitors every transition. If progress pauses, it first completes the current visual frame and retries the requested workspace. If the engine remains stuck for 4.5 seconds, it automatically reveals managed windows, restarts from the last known-good state, and replays the requested D-number. `Win+Ctrl+Shift+R` and the tray menu provide the same safe restart while the engine is responsive. The installer also assigns `Ctrl+Alt+Shift+R` to the Windows Startup shortcut; Explorer owns that hotkey, so it can launch recovery even after the AutoHotkey process has stopped completely.
 
 Clicking an app on the Windows taskbar also follows its workspace assignment. The utility intercepts clicks only within the taskbar's app-button area, freezes the current workspace before forwarding the click to Explorer, and hands that exact frame into the standard directional slide when the app belongs to another D-number. This prevents the app from flashing on the current workspace while preserving the same smooth D3-to-D1 motion used by the hotkeys. The correct D indicator appears, and the next previous/next shortcut continues from that workspace instead of jumping back to it. Non-taskbar activation retains an instant no-reopen fallback because Windows may reveal those windows before notifying other software.
 

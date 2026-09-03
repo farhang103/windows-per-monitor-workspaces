@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.14 - 2026-09-02
+
+- Added hard boundaries to previous/next workspace navigation so D3 cannot wrap to D1 and D1 cannot wrap to D3
+- Applied the same boundary behavior to rapid queued switching requests
+
+## 1.2.13 - 2026-09-02
+
+- Added an Explorer-owned `Ctrl+Alt+Shift+R` recovery hotkey to the installed Startup shortcut
+- Made manual recovery launch the workspace engine even when its AutoHotkey process has already crashed or stopped
+- Resolved packaged-app filesystem redirection to physical runtime and script paths before writing Windows shortcuts
+- Anchored installed logs and saved workspace state to the resolved script location so installer and Explorer launches share the same data
+- Added recovery-hotkey validation to both WScript and native Unicode shortcut installer paths
+- Corrected the startup D-number indicator to show the active workspace on the monitor under the pointer
+
+## 1.2.12 - 2026-09-01
+
+- Added a transition watchdog that accelerates and retries a switch when progress stalls
+- Added automatic engine restart after a prolonged stuck transition, preserving the last known-good state and replaying the requested D-number after startup
+- Caught switch-time runtime errors and routed them through the same restart-and-resume recovery path
+- Added `Win+Ctrl+Shift+R` and a tray command for manual engine restart without clearing workspace assignments
+- Added switch heartbeat, soft recovery, hard recovery, restart, and recovery-replay diagnostics
+
 ## 1.2.11 - 2026-09-01
 
 - Moved the complete workspace engine into per-monitor-v2 DPI awareness instead of applying it only to animation windows

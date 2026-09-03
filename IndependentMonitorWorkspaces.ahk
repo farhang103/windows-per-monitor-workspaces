@@ -6,12 +6,14 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.11"
+APP_VERSION := "1.2.14"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
 RAPID_WORKSPACE_SLIDE_MS := 190
 INDICATOR_MS := 850
+WORKSPACE_WATCHDOG_SOFT_MS := 1400
+WORKSPACE_WATCHDOG_RESTART_MS := 4500
 
 global CurrentWorkspace := Map()
 global WindowWorkspace := Map()
@@ -30,6 +32,13 @@ global OverviewPreviewWindows := []
 global OverviewPreviewMode := false
 global Switching := false
 global SwitchingMonitor := 0
+global SwitchingStartedAt := 0
+global SwitchingLastProgressAt := 0
+global SwitchingTargetWorkspace := 0
+global SwitchingDirection := 0
+global SwitchingSoftRecoveryRequested := false
+global WorkspaceRestartScheduled := false
+global WorkspaceRestartPreviewMode := false
 global RequestedWorkspace := Map()
 global PendingWorkspaceSwitches := Map()
 global WorkspaceSlideSkipRequests := Map()
@@ -38,12 +47,12 @@ global PendingExternalActivations := Map()
 global ForegroundWinEventCallback := 0
 global ForegroundWinEventHook := 0
 global TaskbarActivationShields := Map()
-global DEBUG_LOG_PATH := EnvGet("LOCALAPPDATA") "\IndependentMonitorWorkspaces\debug.log"
-global DEBUG_PREVIOUS_LOG_PATH := EnvGet("LOCALAPPDATA") "\IndependentMonitorWorkspaces\debug.previous.log"
+global DEBUG_LOG_PATH := GetWorkspaceStoragePath("debug.log")
+global DEBUG_PREVIOUS_LOG_PATH := GetWorkspaceStoragePath("debug.previous.log")
 global DEBUG_MAX_BYTES := 4 * 1024 * 1024
 global DEBUG_SESSION_ID := FormatTime(, "yyyyMMdd-HHmmss") "-" DllCall("GetCurrentProcessId", "uint")
-global WORKSPACE_STATE_PATH := EnvGet("LOCALAPPDATA")
-    . "\IndependentMonitorWorkspacesState\workspace-state.tsv"
+global WORKSPACE_STATE_PATH := GetWorkspaceStoragePath("workspace-state.tsv", true)
+global WORKSPACE_RECOVERY_PATH := GetWorkspaceStoragePath("pending-recovery.tsv", true)
 global WorkspaceStatePersistenceEnabled := true
 
 ; AutoHotkey starts system-DPI-aware, which virtualizes screen coordinates on
@@ -58,6 +67,11 @@ SetWinDelay -1
 OnMessage(0x000F, PaintWorkspaceOverview) ; WM_PAINT
 OnMessage(0x0014, HandleWorkspaceSlideEraseBackground) ; WM_ERASEBKGND
 OnMessage(0x0202, HandleOverviewClick) ; WM_LBUTTONUP
+
+if A_Args.Length && A_Args[1] = "--navigation-self-test" {
+    RunNavigationBoundarySelfTest()
+    return
+}
 
 InitializeDebugLogging()
 DebugLog("STARTUP", "version=" APP_VERSION " script=" A_ScriptFullPath
@@ -113,6 +127,21 @@ if A_Args.Length && A_Args[1] = "--taskbar-activation-preview" {
     return
 }
 
+if A_Args.Length && A_Args[1] = "--watchdog-preview" {
+    WorkspaceStatePersistenceEnabled := false
+    WorkspaceRestartPreviewMode := true
+    InitializeMonitors()
+    Switching := true
+    SwitchingMonitor := MonitorGetPrimary()
+    SwitchingTargetWorkspace := 2
+    SwitchingDirection := 1
+    SwitchingStartedAt := A_TickCount - WORKSPACE_WATCHDOG_RESTART_MS - 100
+    SwitchingLastProgressAt := SwitchingStartedAt
+    CheckWorkspaceEngineHealth()
+    SetTimer((*) => ExitApp(), -400)
+    return
+}
+
 InitializeMonitors()
 OnExit(HandleAppExit)
 OnMessage(0x007E, HandleDisplayChange) ; WM_DISPLAYCHANGE
@@ -133,23 +162,29 @@ Hotkey("#^Right", NextWorkspace)
 Hotkey("^!Left", PreviousWorkspace)
 Hotkey("^!Right", NextWorkspace)
 Hotkey("#^+Esc", ResetAndRevealAll)
+Hotkey("#^+r", RestartWorkspaceEngine)
 Hotkey("#^Space", ToggleWorkspaceOverview)
 RegisterTaskbarClickHotkeys()
 SetTimer(CheckWorkspaceOverviewHotCorner, 100)
 InstallForegroundWinEventHook()
 SetTimer(CheckExternalWorkspaceActivation, 15)
+SetTimer(CheckWorkspaceEngineHealth, 250)
 
 A_TrayMenu.Delete()
 A_TrayMenu.Add("Workspace overview", ToggleWorkspaceOverview)
 A_TrayMenu.Add("Show shortcuts", ShowHelp)
 A_TrayMenu.Add("Open debug log", OpenDebugLog)
+A_TrayMenu.Add("Restart workspace engine", RestartWorkspaceEngine)
 A_TrayMenu.Add("Reveal all windows and reset", ResetAndRevealAll)
 A_TrayMenu.Add()
 A_TrayMenu.Add("Exit (reveals hidden windows)", (*) => ExitApp())
 A_TrayMenu.Default := "Show shortcuts"
 A_IconTip := "Independent Monitor Workspaces"
 
-ShowFeedbackForMonitor(GetMonitorUnderMouse(), 1, "Ready")
+ResumePendingWorkspaceRecovery()
+readyMonitor := GetMonitorUnderMouse()
+ShowFeedbackForMonitor(readyMonitor,
+    CurrentWorkspace.Has(readyMonitor) ? CurrentWorkspace[readyMonitor] : 1, "Ready")
 
 InitializeMonitors() {
     global CurrentWorkspace
@@ -162,6 +197,23 @@ InitializeMonitors() {
             " bounds=" left "," top "," right "," bottom
             " dpi=" GetMonitorDpi(A_Index) " current=D1")
     }
+}
+
+GetWorkspaceStoragePath(fileName, stateStore := false) {
+    ; Codex is a packaged app, so files installed under LOCALAPPDATA can be
+    ; physically redirected into the package's LocalCache. Once installed,
+    ; anchor logs and state to the script's resolved on-disk directory so an
+    ; Explorer-launched recovery process sees the same data as the installer.
+    if FileExist(A_ScriptDir "\install.json") {
+        if !stateStore
+            return A_ScriptDir "\" fileName
+        SplitPath(A_ScriptDir, &directoryName, &parentDirectory)
+        return parentDirectory "\IndependentMonitorWorkspacesState\" fileName
+    }
+    directory := stateStore
+        ? "IndependentMonitorWorkspacesState"
+        : "IndependentMonitorWorkspaces"
+    return EnvGet("LOCALAPPDATA") "\" directory "\" fileName
 }
 
 SwitchToWorkspace(workspace, direction := 0, *) {
@@ -180,6 +232,8 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
     global WORKSPACE_SLIDE_MS, RAPID_WORKSPACE_SLIDE_MS
     global HiddenByScript, Switching, SwitchingMonitor, WorkspaceOverview, OverviewPreviewMode
     global RequestedWorkspace, PendingWorkspaceSwitches, WorkspaceSlideSkipRequests
+    global SwitchingStartedAt, SwitchingLastProgressAt, SwitchingTargetWorkspace
+    global SwitchingDirection, SwitchingSoftRecoveryRequested
 
     if Type(direction) != "Integer"
         direction := 0
@@ -209,12 +263,19 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
 
     Switching := true
     SwitchingMonitor := monitor
+    SwitchingStartedAt := A_TickCount
+    SwitchingLastProgressAt := SwitchingStartedAt
+    SwitchingTargetWorkspace := workspace
+    SwitchingDirection := direction
+    SwitchingSoftRecoveryRequested := false
     animation := false
+    switchSucceeded := false
     try {
         EnsureMonitorState()
         oldWorkspace := CurrentWorkspace[monitor]
         DebugLog("SWITCH_BEGIN", "monitor=" monitor " from=D" oldWorkspace
             " to=D" workspace " map=" DebugWorkspaceSummary(monitor))
+        MarkWorkspaceSwitchProgress("begin")
 
         if externalActivatedHwnd
             PrepareShieldedExternalActivation(
@@ -243,6 +304,7 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
         animationDuration := rapid ? RAPID_WORKSPACE_SLIDE_MS : WORKSPACE_SLIDE_MS
         animation := BeginWorkspaceSlideAnimation(
             monitor, oldWorkspace, workspace, direction, animationDuration)
+        MarkWorkspaceSwitchProgress("animation-ready")
         if externalActivatedHwnd && animation
             CancelTaskbarActivationShield(monitor, 0, "animation-handoff")
 
@@ -273,13 +335,16 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
             }
         }
 
+        MarkWorkspaceSwitchProgress("windows-hidden")
         RunWorkspaceSlideAnimation(animation)
+        MarkWorkspaceSwitchProgress("animation-complete")
 
         ; Keep the completed, opaque animation frame in place until every app
         ; that this script hid has acknowledged its show request. A fixed delay
         ; races slower application UI threads and exposes only the first app to
         ; respond. Restore the saved window stack while it is still covered.
         RevealWorkspaceForHandoff(monitor, workspace)
+        MarkWorkspaceSwitchProgress("handoff-complete")
         EndWorkspaceSlideAnimation(animation)
         animation := false
 
@@ -289,32 +354,47 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
         ShowWorkspaceOverlay(monitor, workspace, direction)
         ScheduleWorkspaceStateSave()
         SetTimer(VerifyWorkspaceTransition.Bind(monitor, workspace, 0), -200)
+        switchSucceeded := true
+    } catch as error {
+        DebugLog("SWITCH_ERROR", "monitor=" monitor " target=D" workspace
+            " message=" DebugClean(error.Message) " what=" DebugClean(error.What)
+            " line=" error.Line)
+        ScheduleWorkspaceEngineRestart(
+            "switch-exception", monitor, workspace, direction)
     } finally {
-        EndWorkspaceSlideAnimation(animation)
+        try EndWorkspaceSlideAnimation(animation)
         if externalActivatedHwnd
             CancelTaskbarActivationShield(monitor, 0, "switch-finalize")
         if WorkspaceSlideSkipRequests.Has(monitor)
             WorkspaceSlideSkipRequests.Delete(monitor)
         Switching := false
         SwitchingMonitor := 0
+        SwitchingStartedAt := 0
+        SwitchingLastProgressAt := 0
+        SwitchingTargetWorkspace := 0
+        SwitchingDirection := 0
+        SwitchingSoftRecoveryRequested := false
         DebugLog("SWITCH_END", "monitor=" monitor " target=D" workspace
             " current=" (CurrentWorkspace.Has(monitor) ? "D" CurrentWorkspace[monitor] : "missing"))
         if PendingWorkspaceSwitches.Count
             SetTimer(ProcessPendingWorkspaceSwitches, -1)
     }
-    return true
+    return switchSucceeded
 }
 
 PreviousWorkspace(*) {
-    global WORKSPACE_COUNT, CurrentWorkspace, RequestedWorkspace
+    global CurrentWorkspace, RequestedWorkspace
     EnsureMonitorState()
     monitor := GetMonitorUnderMouse()
     baseWorkspace := RequestedWorkspace.Has(monitor)
         ? RequestedWorkspace[monitor] : CurrentWorkspace[monitor]
-    next := baseWorkspace - 1
-    if next < 1
-        next := WORKSPACE_COUNT
-    SwitchToWorkspace(next, -1)
+    nextWorkspace := GetAdjacentWorkspace(baseWorkspace, -1)
+    if nextWorkspace = baseWorkspace {
+        DebugLog("SWITCH_BOUNDARY", "monitor=" monitor
+            " direction=-1 requested=D" baseWorkspace " boundary=D1")
+        return
+    }
+    SwitchToWorkspace(nextWorkspace, -1)
 }
 
 NextWorkspace(*) {
@@ -323,10 +403,60 @@ NextWorkspace(*) {
     monitor := GetMonitorUnderMouse()
     baseWorkspace := RequestedWorkspace.Has(monitor)
         ? RequestedWorkspace[monitor] : CurrentWorkspace[monitor]
-    next := baseWorkspace + 1
-    if next > WORKSPACE_COUNT
-        next := 1
-    SwitchToWorkspace(next, 1)
+    nextWorkspace := GetAdjacentWorkspace(baseWorkspace, 1)
+    if nextWorkspace = baseWorkspace {
+        DebugLog("SWITCH_BOUNDARY", "monitor=" monitor
+            " direction=1 requested=D" baseWorkspace
+            " boundary=D" WORKSPACE_COUNT)
+        return
+    }
+    SwitchToWorkspace(nextWorkspace, 1)
+}
+
+GetAdjacentWorkspace(baseWorkspace, direction) {
+    global WORKSPACE_COUNT
+    return Max(1, Min(WORKSPACE_COUNT, baseWorkspace + direction))
+}
+
+RunNavigationBoundarySelfTest() {
+    cases := [
+        [1, -1, 1],
+        [1, 1, 2],
+        [2, -1, 1],
+        [2, 1, 3],
+        [3, -1, 2],
+        [3, 1, 3]
+    ]
+    for testCase in cases {
+        actual := GetAdjacentWorkspace(testCase[1], testCase[2])
+        if actual != testCase[3] {
+            FileAppend("Navigation boundary self-test failed: base=D"
+                testCase[1] " direction=" testCase[2] " expected=D"
+                testCase[3] " actual=D" actual "`n", "*")
+            ExitApp(1)
+        }
+    }
+
+    ; Repeated input is calculated from the latest requested D-number. Verify
+    ; that extra presses remain pinned to each edge instead of wrapping.
+    workspace := 1
+    Loop 5
+        workspace := GetAdjacentWorkspace(workspace, 1)
+    if workspace != 3 {
+        FileAppend("Navigation boundary self-test failed: repeated right ended at D"
+            workspace "`n", "*")
+        ExitApp(1)
+    }
+    Loop 5
+        workspace := GetAdjacentWorkspace(workspace, -1)
+    if workspace != 1 {
+        FileAppend("Navigation boundary self-test failed: repeated left ended at D"
+            workspace "`n", "*")
+        ExitApp(1)
+    }
+
+    FileAppend("Navigation boundary self-test passed.`n", "*")
+    ExitApp(0)
 }
 
 MoveActiveWindowToWorkspace(workspace, *) {
@@ -2198,8 +2328,8 @@ SyncRequestedWorkspaces() {
 }
 
 ProcessPendingWorkspaceSwitches(*) {
-    global Switching, PendingWorkspaceSwitches
-    if Switching || !PendingWorkspaceSwitches.Count
+    global Switching, PendingWorkspaceSwitches, WorkspaceRestartScheduled
+    if Switching || WorkspaceRestartScheduled || !PendingWorkspaceSwitches.Count
         return
     for monitor, request in PendingWorkspaceSwitches.Clone() {
         PendingWorkspaceSwitches.Delete(monitor)
@@ -2213,6 +2343,154 @@ ProcessPendingWorkspaceSwitches(*) {
     }
     if PendingWorkspaceSwitches.Count
         SetTimer(ProcessPendingWorkspaceSwitches, -1)
+}
+
+MarkWorkspaceSwitchProgress(stage) {
+    global SwitchingLastProgressAt, SwitchingMonitor, SwitchingTargetWorkspace
+    SwitchingLastProgressAt := A_TickCount
+    DebugLog("SWITCH_PROGRESS", "stage=" stage " monitor=" SwitchingMonitor
+        " target=D" SwitchingTargetWorkspace)
+}
+
+CheckWorkspaceEngineHealth(*) {
+    global Switching, SwitchingMonitor, SwitchingStartedAt, SwitchingLastProgressAt
+    global SwitchingTargetWorkspace, SwitchingDirection, SwitchingSoftRecoveryRequested
+    global WORKSPACE_WATCHDOG_SOFT_MS, WORKSPACE_WATCHDOG_RESTART_MS
+    global PendingWorkspaceSwitches, RequestedWorkspace, WorkspaceSlideSkipRequests
+    global WorkspaceRestartScheduled
+
+    if WorkspaceRestartScheduled
+        return
+    if !Switching {
+        if SwitchingStartedAt || SwitchingLastProgressAt {
+            DebugLog("WATCHDOG_STATE_REPAIR", "reason=orphan-timestamps")
+            SwitchingStartedAt := 0
+            SwitchingLastProgressAt := 0
+        }
+        return
+    }
+
+    now := A_TickCount
+    elapsed := SwitchingStartedAt ? now - SwitchingStartedAt : 0
+    idle := SwitchingLastProgressAt ? now - SwitchingLastProgressAt : elapsed
+    if !SwitchingSoftRecoveryRequested && idle >= WORKSPACE_WATCHDOG_SOFT_MS {
+        SwitchingSoftRecoveryRequested := true
+        if SwitchingMonitor {
+            WorkspaceSlideSkipRequests[SwitchingMonitor] := true
+            RequestedWorkspace[SwitchingMonitor] := SwitchingTargetWorkspace
+            PendingWorkspaceSwitches[SwitchingMonitor] := {
+                workspace: SwitchingTargetWorkspace,
+                direction: SwitchingDirection,
+                rapid: true
+            }
+        }
+        DebugLog("WATCHDOG_SOFT_RECOVERY", "monitor=" SwitchingMonitor
+            " target=D" SwitchingTargetWorkspace " elapsedMs=" elapsed
+            " idleMs=" idle " action=finish-and-retry")
+    }
+
+    if elapsed >= WORKSPACE_WATCHDOG_RESTART_MS {
+        DebugLog("WATCHDOG_HARD_RECOVERY", "monitor=" SwitchingMonitor
+            " target=D" SwitchingTargetWorkspace " elapsedMs=" elapsed
+            " idleMs=" idle " action=restart-and-resume")
+        ScheduleWorkspaceEngineRestart("stalled-switch", SwitchingMonitor,
+            SwitchingTargetWorkspace, SwitchingDirection)
+    }
+}
+
+RestartWorkspaceEngine(*) {
+    ScheduleWorkspaceEngineRestart("manual")
+}
+
+ScheduleWorkspaceEngineRestart(reason, monitor := 0, workspace := 0, direction := 0) {
+    global WorkspaceRestartScheduled, WorkspaceRestartPreviewMode
+    global WorkspaceStatePersistenceEnabled, Switching
+    if WorkspaceRestartScheduled
+        return false
+    WorkspaceRestartScheduled := true
+
+    if WorkspaceRestartPreviewMode {
+        DebugLog("ENGINE_RESTART_PREVIEW", "reason=" reason " monitor=" monitor
+            " workspace=" workspace " direction=" direction)
+        return true
+    }
+
+    if !Switching
+        try SaveWorkspaceState()
+    if monitor && workspace
+        WriteWorkspaceRecoveryRequest(monitor, workspace, direction, reason)
+    ; A stalled transition may have partially hidden windows. Do not overwrite
+    ; the last known-good state during OnExit; it will reveal all windows, then
+    ; the new process will reapply that state and replay the pending request.
+    WorkspaceStatePersistenceEnabled := false
+    DebugLog("ENGINE_RESTART_SCHEDULE", "reason=" reason " monitor=" monitor
+        " workspace=" workspace " direction=" direction " delayMs=80")
+    SetTimer(PerformWorkspaceEngineRestart.Bind(reason), -80)
+    return true
+}
+
+PerformWorkspaceEngineRestart(reason) {
+    DebugLog("ENGINE_RESTART", "reason=" reason)
+    Reload()
+}
+
+WriteWorkspaceRecoveryRequest(monitor, workspace, direction, reason) {
+    global WORKSPACE_RECOVERY_PATH
+    try {
+        SplitPath(WORKSPACE_RECOVERY_PATH,, &recoveryDirectory)
+        DirCreate(recoveryDirectory)
+        if FileExist(WORKSPACE_RECOVERY_PATH)
+            FileDelete(WORKSPACE_RECOVERY_PATH)
+        FileAppend(MonitorGetName(monitor) "`t" workspace "`t" direction
+            "`t" reason, WORKSPACE_RECOVERY_PATH, "UTF-8")
+        DebugLog("RECOVERY_REQUEST_SAVE", "monitor=" monitor " target=D" workspace
+            " direction=" direction " reason=" reason)
+        return true
+    } catch as error {
+        DebugLog("RECOVERY_REQUEST_ERROR", "action=save message="
+            DebugClean(error.Message))
+        return false
+    }
+}
+
+ResumePendingWorkspaceRecovery() {
+    global WORKSPACE_RECOVERY_PATH, WORKSPACE_COUNT
+    if !FileExist(WORKSPACE_RECOVERY_PATH)
+        return false
+    try {
+        contents := Trim(FileRead(WORKSPACE_RECOVERY_PATH, "UTF-8"))
+        FileDelete(WORKSPACE_RECOVERY_PATH)
+        fields := StrSplit(contents, "`t")
+        if fields.Length < 3
+            throw Error("Recovery request is incomplete")
+        deviceName := fields[1]
+        workspace := Integer(fields[2])
+        direction := Integer(fields[3])
+        if workspace < 1 || workspace > WORKSPACE_COUNT
+            throw Error("Recovery workspace is invalid")
+        monitor := 0
+        Loop MonitorGetCount() {
+            if StrLower(MonitorGetName(A_Index)) = StrLower(deviceName) {
+                monitor := A_Index
+                break
+            }
+        }
+        if !monitor
+            throw Error("Recovery monitor is no longer connected")
+        DebugLog("RECOVERY_REQUEST_RESUME", "monitor=" monitor
+            " target=D" workspace " direction=" direction " delayMs=350")
+        SetTimer(SwitchToWorkspaceOnMonitor.Bind(
+            workspace, monitor, direction, true), -350)
+        return true
+    } catch as error {
+        try {
+            if FileExist(WORKSPACE_RECOVERY_PATH)
+                FileDelete(WORKSPACE_RECOVERY_PATH)
+        }
+        DebugLog("RECOVERY_REQUEST_ERROR", "action=resume message="
+            DebugClean(error.Message))
+        return false
+    }
 }
 
 ForgetWindow(hwnd) {
@@ -3180,6 +3458,8 @@ ShowHelp(*) {
         . "Win+Ctrl+Space          Show all workspace windows`n"
         . "Win+Ctrl+1.." WORKSPACE_COUNT "       Open a numbered workspace`n"
         . "Win+Ctrl+Shift+1.." WORKSPACE_COUNT " Move the active window`n"
+        . "Win+Ctrl+Shift+R        Restart and recover the workspace engine`n"
+        . "Ctrl+Alt+Shift+R        Launch recovery even if the engine stopped`n"
         . "Win+Ctrl+Shift+Esc      Reveal everything and reset`n`n"
         . "Move the pointer to a monitor's top-left corner and hold to open the overview.`n`n"
         . "Keep Windows itself on one native virtual desktop while using this script.",
