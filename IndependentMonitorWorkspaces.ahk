@@ -6,7 +6,7 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.15"
+APP_VERSION := "1.2.17"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
@@ -313,9 +313,8 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
         ; The animation layer owns captured window surfaces while the real
         ; outgoing windows are hidden underneath it.
         animationDuration := rapid ? RAPID_WORKSPACE_SLIDE_MS : WORKSPACE_SLIDE_MS
-        if !draggedHwnd
-            animation := BeginWorkspaceSlideAnimation(
-                monitor, oldWorkspace, workspace, direction, animationDuration)
+        animation := BeginWorkspaceSlideAnimation(
+            monitor, oldWorkspace, workspace, direction, animationDuration, draggedHwnd)
         MarkWorkspaceSwitchProgress("animation-ready")
         if externalActivatedHwnd && animation
             CancelTaskbarActivationShield(monitor, 0, "animation-handoff")
@@ -1615,7 +1614,8 @@ CheckWorkspaceOverviewHotCorner() {
     global WorkspaceOverview, OverviewHotCornerMonitor, OverviewHotCornerEnteredAt
     global OverviewHotCornerCooldownUntil
 
-    if WorkspaceOverview || (DllCall("GetAsyncKeyState", "int", 0x01, "short") & 0x8000) {
+    if WorkspaceOverview || (DllCall("GetAsyncKeyState", "int", 0x01, "short") & 0x8000)
+        || IsForegroundFullscreen() {
         OverviewHotCornerMonitor := 0
         OverviewHotCornerEnteredAt := 0
         return
@@ -1650,6 +1650,32 @@ CheckWorkspaceOverviewHotCorner() {
         OverviewHotCornerEnteredAt := 0
         OverviewHotCornerCooldownUntil := A_TickCount + 1500
         ShowWorkspaceOverview(monitor)
+    }
+}
+
+IsForegroundFullscreen() {
+    ; Check the focused app's monitor, even if the pointer escapes to another
+    ; display. Only the automatic hot corner is blocked; the hotkey still works.
+    hwnd := WinExist("A")
+    if !hwnd
+        return false
+    try {
+        class := WinGetClass("ahk_id " hwnd)
+        if class = "Progman" || class = "WorkerW"
+            || class = "Shell_TrayWnd" || class = "Shell_SecondaryTrayWnd"
+            return false
+        if WinGetMinMax("ahk_id " hwnd) = -1
+            return false
+        ; Captioned maximized apps can extend past the monitor with an auto-hide
+        ; taskbar. Fullscreen and borderless games do not have a normal caption.
+        if (WinGetStyle("ahk_id " hwnd) & 0x00C00000) = 0x00C00000
+            return false
+        WinGetPos(&x, &y, &width, &height, "ahk_id " hwnd)
+        MonitorGet(GetWindowMonitor(hwnd), &left, &top, &right, &bottom)
+        return x <= left && y <= top && x + width >= right && y + height >= bottom
+    } catch {
+        ; The foreground window may disappear between queries.
+        return false
     }
 }
 
@@ -2254,7 +2280,7 @@ DebugWindowOrder(order) {
     return value ? value : "none"
 }
 
-CaptureWindowSnapshot(hwnd) {
+CaptureWindowSnapshot(hwnd, allowScreenCapture := true) {
     global WindowSnapshots
     if !WinExist("ahk_id " hwnd)
         return false
@@ -2286,7 +2312,7 @@ CaptureWindowSnapshot(hwnd) {
     oldBitmap := DllCall("SelectObject", "ptr", memoryDc, "ptr", bitmap, "ptr")
     captured := false
     try captured := DllCall("PrintWindow", "ptr", hwnd, "ptr", memoryDc, "uint", 2, "int") != 0
-    if !captured {
+    if !captured && allowScreenCapture {
         captured := DllCall("BitBlt", "ptr", memoryDc,
             "int", 0, "int", 0, "int", width, "int", height,
             "ptr", screenDc, "int", left, "int", top, "uint", 0x00CC0020, "int") != 0
@@ -2653,7 +2679,8 @@ ResetAndRevealAll(*) {
     DebugLog("RESET", "complete")
 }
 
-BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, duration := 0) {
+BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, duration := 0,
+    draggedHwnd := 0) {
     global WORKSPACE_SLIDE_MS, WorkspaceSlideAnimations
     if !duration
         duration := WORKSPACE_SLIDE_MS
@@ -2663,17 +2690,21 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
     MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
     width := right - left
     height := bottom - top
-    RefreshWorkspaceWindowSnapshots(monitor, oldWorkspace)
+    RefreshWorkspaceWindowSnapshots(monitor, oldWorkspace, draggedHwnd)
     outgoingCaptureStarted := A_TickCount
-    outgoingFrame := CaptureMonitorWorkspaceFrame(monitor, oldWorkspace)
+    ; A screen capture would bake the held window into the outgoing desktop,
+    ; making a second copy slide away. Compose both desktops without it instead.
+    outgoingFrame := draggedHwnd
+        ? BuildWorkspaceFrameFromSnapshots(monitor, oldWorkspace, draggedHwnd)
+        : CaptureMonitorWorkspaceFrame(monitor, oldWorkspace)
     outgoingCaptureMs := A_TickCount - outgoingCaptureStarted
     if !outgoingFrame
-        outgoingFrame := BuildWorkspaceFrameFromSnapshots(monitor, oldWorkspace)
-    incomingWasCached := GetWorkspaceFrame(monitor, newWorkspace) != false
+        outgoingFrame := BuildWorkspaceFrameFromSnapshots(monitor, oldWorkspace, draggedHwnd)
+    incomingWasCached := !draggedHwnd && GetWorkspaceFrame(monitor, newWorkspace) != false
     incomingStarted := A_TickCount
-    incomingFrame := GetWorkspaceFrame(monitor, newWorkspace)
+    incomingFrame := draggedHwnd ? false : GetWorkspaceFrame(monitor, newWorkspace)
     if !incomingFrame
-        incomingFrame := BuildWorkspaceFrameFromSnapshots(monitor, newWorkspace)
+        incomingFrame := BuildWorkspaceFrameFromSnapshots(monitor, newWorkspace, draggedHwnd)
     incomingPreparationMs := A_TickCount - incomingStarted
     if !outgoingFrame || !incomingFrame {
         DebugLog("SLIDE_SKIP", "reason=frame-capture-failed monitor=" monitor
@@ -2682,11 +2713,16 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
     }
 
     layer := CreatePhysicalPixelLayer()
+    ; Keep the real app in its existing Z-order and native mouse-capture loop.
+    ; Only our own layer moves behind it; the app never becomes topmost.
+    if draggedHwnd
+        layer.Opt("-AlwaysOnTop")
+    insertAfter := draggedHwnd ? draggedHwnd : -1
     state := {
         gui: layer, hwnd: 0, monitor: monitor,
         left: left, top: top, width: width, height: height,
         oldWorkspace: oldWorkspace, newWorkspace: newWorkspace,
-        direction: direction, duration: duration,
+        direction: direction, duration: duration, draggedHwnd: draggedHwnd,
         outgoingFrame: outgoingFrame, incomingFrame: incomingFrame,
         outgoingOffset: 0, incomingOffset: direction * width,
         bufferDc: 0, bufferBitmap: 0, oldBufferBitmap: 0, sourceDc: 0
@@ -2696,7 +2732,7 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
     ; Size the still-hidden layer in physical pixels. Never use Gui.Show here:
     ; it can present a DPI-scaled intermediate frame before SetWindowPos fixes
     ; the dimensions, which looks like a zoom immediately before the slide.
-    try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", -1,
+    try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", insertAfter,
         "int", left, "int", top, "int", width, "int", height,
         "uint", 0x0010)
     if !InitializeWorkspaceSlideBackBuffer(state) {
@@ -2706,13 +2742,14 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
         return false
     }
     WorkspaceSlideAnimations[state.hwnd] := state
-    try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", -1,
+    try DllCall("SetWindowPos", "ptr", state.hwnd, "ptr", insertAfter,
         "int", left, "int", top, "int", width, "int", height,
         "uint", 0x0050)
     RenderWorkspaceSlideFrame(state)
     try DllCall("dwmapi\DwmFlush")
     DebugLog("SLIDE_BEGIN", "monitor=" monitor " from=D" oldWorkspace
         " to=D" newWorkspace " direction=" direction
+        " carriedHwnd=" draggedHwnd
         " mode=double-buffered-bitblt durationMs=" state.duration
         " resolution=" width "x" height " dpi=" GetMonitorDpi(monitor)
         " geometry=" DebugWindowRenderGeometry(state.hwnd)
@@ -2723,16 +2760,18 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
     return state
 }
 
-RefreshWorkspaceWindowSnapshots(monitor, workspace) {
+RefreshWorkspaceWindowSnapshots(monitor, workspace, excludedHwnd := 0) {
     windows := GetOverviewWindows(monitor, workspace)
     for hwnd in windows {
+        if hwnd = excludedHwnd
+            continue
         if !WinExist("ahk_id " hwnd)
             continue
         try minimized := WinGetMinMax("ahk_id " hwnd) = -1
         catch
             minimized := false
         if !minimized
-            CaptureWindowSnapshot(hwnd)
+            CaptureWindowSnapshot(hwnd, !excludedHwnd)
     }
 }
 
@@ -2769,7 +2808,7 @@ CaptureMonitorWorkspaceFrame(monitor, workspace) {
         {bitmap: bitmap, width: width, height: height})
 }
 
-BuildWorkspaceFrameFromSnapshots(monitor, workspace) {
+BuildWorkspaceFrameFromSnapshots(monitor, workspace, excludedHwnd := 0) {
     global WindowSnapshots, OverviewPreviewMode
     MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
     width := right - left
@@ -2799,6 +2838,8 @@ BuildWorkspaceFrameFromSnapshots(monitor, workspace) {
     drawn := 0
     Loop windows.Length {
         hwnd := windows[windows.Length - A_Index + 1]
+        if hwnd = excludedHwnd
+            continue
         if !WinExist("ahk_id " hwnd)
             continue
         if !OverviewPreviewMode && !IsManageableWindow(hwnd)
@@ -2809,7 +2850,7 @@ BuildWorkspaceFrameFromSnapshots(monitor, workspace) {
         if minimized
             continue
         if !WindowSnapshots.Has(hwnd)
-            CaptureWindowSnapshot(hwnd)
+            CaptureWindowSnapshot(hwnd, !excludedHwnd)
         if !WindowSnapshots.Has(hwnd)
             continue
         rect := Buffer(16, 0)

@@ -63,7 +63,7 @@ Three workspaces are enabled by default. Change `WORKSPACE_COUNT := 3` near the 
 
 Previous/next navigation has hard boundaries: moving right stops at the highest D-number, and moving left stops at D1. It never wraps directly from D3 to D1 or from D1 to D3.
 
-To carry a window to another workspace, hold its title bar and start dragging, then press `Win+Ctrl+Left` / `Win+Ctrl+Right`, `Ctrl+Alt+Left` / `Ctrl+Alt+Right`, or a numbered workspace shortcut while keeping the mouse button held. The window stays with you as you switch; release it to leave it there. The monitor under the pointer controls which workspace switches. If you finish on another monitor, the window joins that monitor's active workspace using the usual window-position rule. Switching during a drag is instant, and the hot corner stays inactive until you release the mouse. This supports standard Windows window move/resize drags; file drags, text selection, and custom app drag systems are not treated as window moves.
+To carry a window to another workspace, hold its title bar and start dragging, then press `Win+Ctrl+Left` / `Win+Ctrl+Right`, `Ctrl+Alt+Left` / `Ctrl+Alt+Right`, or a numbered workspace shortcut while keeping the mouse button held. The window stays with you as you switch; release it to leave it there. The monitor under the pointer controls which workspace switches. If you finish on another monitor, the window joins that monitor's active workspace using the usual window-position rule. While you hold the window, the desktops slide left or right behind it with the normal switching animation. The held window stays live above the slide, and the hot corner stays inactive until you release the mouse. This supports standard Windows window move/resize drags; file drags, text selection, and custom app drag systems are not treated as window moves.
 
 Workspace changes use a 340 ms directional slide with no crossfade. Moving to a higher D-number slides the current workspace left and brings the next one in from the right; moving to a lower D-number reverses that motion. Two opaque, monitor-sized workspace frames are composed at the monitor's physical resolution in a persistent off-screen buffer and presented as one Desktop Window Manager-synchronized surface. The surface is created in per-monitor-v2 DPI mode and sized while hidden with physical-pixel coordinates, so no scaled or zoomed frame appears before the slide. Its edges remain pixel-locked, preventing wallpaper gaps, erase flicker, or DPI rescaling while real application positions and maximized state remain unchanged.
 
@@ -78,6 +78,8 @@ Clicking an app on the Windows taskbar also follows its workspace assignment. Th
 ## Workspace overview
 
 Press `Win+Ctrl+Space`, or hold the pointer in a monitor's top-left corner for half a second, to see every workspace on that monitor. The active workspace uses live window thumbnails. Inactive workspaces use snapshots captured immediately before their windows were hidden.
+
+The mouse corner is disabled while a fullscreen or borderless fullscreen app is focused, including games. `Win+Ctrl+Space` remains available, and the corner works again after leaving fullscreen or switching to a normal window.
 
 - Click a `D1`, `D2`, or `D3` panel to switch to that workspace.
 - Click a window preview to switch to its workspace, show the `D1`, `D2`, or `D3` indicator, and focus that window.

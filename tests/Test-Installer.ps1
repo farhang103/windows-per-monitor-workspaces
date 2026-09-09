@@ -96,6 +96,7 @@ try {
 
     Write-Host 'Testing bounded previous/next navigation...' -ForegroundColor Cyan
     & $installedRuntime /ErrorStdOut $installedScript --navigation-self-test
+    & (Join-Path $PSScriptRoot 'Test-FullscreenOverview.ps1') -AutoHotkeyPath $installedRuntime
     Assert-Equal 0 $LASTEXITCODE 'Navigation boundary self-test exit code'
 
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)

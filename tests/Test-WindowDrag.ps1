@@ -52,13 +52,13 @@ RunDragTests() {
 
     AssertDrag(SwitchToWorkspaceOnMonitor(3, 1), "repeated held switch succeeds")
     AssertDrag(WindowWorkspace[101].workspace = 3 && TestWindows[101], "carry continues into D3")
-    AssertDrag(TestAnimations = 0, "held switching never creates a covering animation")
+    AssertDrag(TestAnimations = 2, "each held switch animates behind the carried window")
     TestDragged := 0
     FinishWorkspaceWindowDrag()
     AssertDrag(!CarriedWorkspaceWindow && WindowWorkspace[101].workspace = 3, "drop stays on D3")
     SwitchToWorkspaceOnMonitor(2, 1)
     AssertDrag(!TestWindows[101] && WindowWorkspace[101].workspace = 3, "released window stays behind")
-    AssertDrag(TestAnimations = 1, "normal switching still uses animation")
+    AssertDrag(TestAnimations = 3, "normal switching still uses animation")
 
     TestWindows[101] := true
     HiddenByScript.Delete(101)
@@ -126,8 +126,11 @@ ShowWindowFast(hwnd) {
     global TestWindows
     TestWindows[hwnd] := true
 }
-BeginWorkspaceSlideAnimation(*) {
-    global TestAnimations
+BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, duration,
+    draggedHwnd := 0) {
+    global TestAnimations, TestDragged
+    AssertDrag(draggedHwnd = TestDragged, "animation receives the current held window")
+    AssertDrag(direction = (newWorkspace > oldWorkspace ? 1 : -1), "slide direction follows destination")
     TestAnimations += 1
     return false
 }

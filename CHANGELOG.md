@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.17 - 2026-09-09
+
+- Animate left/right workspace switching while carrying a held window
+- Keep the live held window above the slide and omit it from both desktop frames so no duplicate slides away
+
+## 1.2.16 - 2026-09-09
+
+- Suppress the overview mouse corner while a fullscreen or borderless fullscreen app is focused, including when the pointer reaches another monitor
+- Keep the overview keyboard shortcut available during fullscreen use
+
 ## 1.2.15 - 2026-09-08
 
 - Keep a held window visible and carry it into the selected workspace when switching during a native window drag
