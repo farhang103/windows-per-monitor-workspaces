@@ -6,7 +6,7 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.14"
+APP_VERSION := "1.2.15"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
@@ -47,6 +47,7 @@ global PendingExternalActivations := Map()
 global ForegroundWinEventCallback := 0
 global ForegroundWinEventHook := 0
 global TaskbarActivationShields := Map()
+global CarriedWorkspaceWindow := 0
 global DEBUG_LOG_PATH := GetWorkspaceStoragePath("debug.log")
 global DEBUG_PREVIOUS_LOG_PATH := GetWorkspaceStoragePath("debug.previous.log")
 global DEBUG_MAX_BYTES := 4 * 1024 * 1024
@@ -261,6 +262,7 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
     if WorkspaceOverview
         CloseWorkspaceOverview(false)
 
+    FinishWorkspaceWindowDrag()
     Switching := true
     SwitchingMonitor := monitor
     SwitchingStartedAt := A_TickCount
@@ -299,11 +301,21 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
         ; from deciding which maximized app appears on top when we return.
         RememberWorkspaceWindowOrder(monitor, oldWorkspace)
 
+        ; A native title-bar drag must never be hidden or covered by the slide.
+        ; Resolve at execution time so queued requests cannot carry a window
+        ; after the user has already released it.
+        draggedHwnd := GetDraggedWorkspaceWindow()
+        if draggedHwnd {
+            CarryWindowToWorkspace(draggedHwnd, monitor, workspace)
+            CancelTaskbarActivationShield(monitor, 0, "window-drag")
+        }
+
         ; The animation layer owns captured window surfaces while the real
         ; outgoing windows are hidden underneath it.
         animationDuration := rapid ? RAPID_WORKSPACE_SLIDE_MS : WORKSPACE_SLIDE_MS
-        animation := BeginWorkspaceSlideAnimation(
-            monitor, oldWorkspace, workspace, direction, animationDuration)
+        if !draggedHwnd
+            animation := BeginWorkspaceSlideAnimation(
+                monitor, oldWorkspace, workspace, direction, animationDuration)
         MarkWorkspaceSwitchProgress("animation-ready")
         if externalActivatedHwnd && animation
             CancelTaskbarActivationShield(monitor, 0, "animation-handoff")
@@ -343,7 +355,7 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
         ; that this script hid has acknowledged its show request. A fixed delay
         ; races slower application UI threads and exposes only the first app to
         ; respond. Restore the saved window stack while it is still covered.
-        RevealWorkspaceForHandoff(monitor, workspace)
+        RevealWorkspaceForHandoff(monitor, workspace, 260, draggedHwnd)
         MarkWorkspaceSwitchProgress("handoff-complete")
         EndWorkspaceSlideAnimation(animation)
         animation := false
@@ -380,6 +392,65 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
             SetTimer(ProcessPendingWorkspaceSwitches, -1)
     }
     return switchSucceeded
+}
+
+GetDraggedWorkspaceWindow() {
+    ; GUITHREADINFO identifies the actual native move/size loop, avoiding
+    ; false carries when selecting text, dragging a file, or holding a click.
+    if !(DllCall("GetAsyncKeyState", "int", 0x01, "short") & 0x8000)
+        return 0
+    info := Buffer(24 + 6 * A_PtrSize, 0)
+    NumPut("uint", info.Size, info, 0)
+    if !DllCall("GetGUIThreadInfo", "uint", 0, "ptr", info, "int")
+        return 0
+    if !(NumGet(info, 4, "uint") & 0x02) ; GUI_INMOVESIZE
+        return 0
+    hwnd := NumGet(info, 8 + 4 * A_PtrSize, "ptr")
+    return hwnd && IsVisible(hwnd) && IsManageableWindow(hwnd) ? hwnd : 0
+}
+
+AssignCarriedWorkspaceWindow(hwnd, monitor, workspace) {
+    global WindowWorkspace
+    if WindowWorkspace.Has(hwnd) {
+        previous := WindowWorkspace[hwnd]
+        InvalidateWorkspaceFrame(previous.monitor, previous.workspace)
+    }
+    InvalidateWorkspaceFrame(monitor, workspace)
+    DeleteWindowSnapshot(hwnd)
+    WindowWorkspace[hwnd] := {monitor: monitor, workspace: workspace}
+    PromoteWorkspaceWindow(monitor, workspace, hwnd)
+    ScheduleWorkspaceStateSave()
+}
+
+CarryWindowToWorkspace(hwnd, monitor, workspace) {
+    global CarriedWorkspaceWindow, PendingExternalActivations
+    CarriedWorkspaceWindow := hwnd
+    if PendingExternalActivations.Has(hwnd)
+        PendingExternalActivations.Delete(hwnd)
+    AssignCarriedWorkspaceWindow(hwnd, monitor, workspace)
+    SetTimer(FinishWorkspaceWindowDrag, 30)
+    DebugLog("DRAG_CARRY", "hwnd=" hwnd " monitor=" monitor " target=D" workspace)
+}
+
+FinishWorkspaceWindowDrag(*) {
+    global CarriedWorkspaceWindow, CurrentWorkspace, Switching
+    if Switching
+        return
+    hwnd := CarriedWorkspaceWindow
+    if hwnd && GetDraggedWorkspaceWindow() = hwnd
+        return
+    SetTimer(FinishWorkspaceWindowDrag, 0)
+    CarriedWorkspaceWindow := 0
+    if !hwnd || !WinExist("ahk_id " hwnd)
+        return
+    ; A window can cross another display after the last shortcut. Commit to
+    ; the display where it was dropped, using the usual window-monitor rule.
+    monitor := GetWindowMonitor(hwnd)
+    if CurrentWorkspace.Has(monitor) {
+        AssignCarriedWorkspaceWindow(hwnd, monitor, CurrentWorkspace[monitor])
+        DebugLog("DRAG_DROP", "hwnd=" hwnd " monitor=" monitor
+            " workspace=D" CurrentWorkspace[monitor])
+    }
 }
 
 PreviousWorkspace(*) {
@@ -1266,6 +1337,9 @@ QueueExternalWorkspaceActivation(hwnd, source, eventTime := 0) {
     global CurrentWorkspace, WindowWorkspace, HiddenByScript
     global PendingExternalActivations, TaskbarActivationShields
     global ExternalActivationHandling
+    global CarriedWorkspaceWindow
+    if hwnd && hwnd = CarriedWorkspaceWindow
+        return false
     if ExternalActivationHandling
         return true
     if !hwnd || !WindowWorkspace.Has(hwnd)
@@ -1541,7 +1615,7 @@ CheckWorkspaceOverviewHotCorner() {
     global WorkspaceOverview, OverviewHotCornerMonitor, OverviewHotCornerEnteredAt
     global OverviewHotCornerCooldownUntil
 
-    if WorkspaceOverview {
+    if WorkspaceOverview || (DllCall("GetAsyncKeyState", "int", 0x01, "short") & 0x8000) {
         OverviewHotCornerMonitor := 0
         OverviewHotCornerEnteredAt := 0
         return
@@ -1820,6 +1894,7 @@ SimulateTaskbarWorkspaceActivation(monitor) {
 LearnVisibleWindows() {
     global CurrentWorkspace, WindowWorkspace, HiddenByScript
     global OverviewPreviewMode
+    global CarriedWorkspaceWindow
 
     ; Regression previews own an isolated set of synthetic windows. Never pull
     ; the user's real applications into those temporary workspace assignments.
@@ -1831,6 +1906,8 @@ LearnVisibleWindows() {
     learned := 0
     moved := 0
     for hwnd in WinGetList() {
+        if hwnd = CarriedWorkspaceWindow
+            continue
         if HiddenByScript.Has(hwnd)
             continue
         if !IsManageableWindow(hwnd) || !IsVisible(hwnd)
@@ -2054,7 +2131,7 @@ GetWorkspaceWindowOrder(monitor, workspace) {
     return order
 }
 
-RestoreWorkspaceWindowOrder(monitor, workspace) {
+RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd := 0) {
     order := GetWorkspaceWindowOrder(monitor, workspace)
     restored := 0
 
@@ -2062,12 +2139,14 @@ RestoreWorkspaceWindowOrder(monitor, workspace) {
     ; ordering without activating or moving any application window.
     Loop order.Length {
         hwnd := order[order.Length - A_Index + 1]
+        if hwnd = draggedHwnd
+            continue
         if !WinExist("ahk_id " hwnd) || !IsVisible(hwnd)
             continue
         try {
-            result := DllCall("SetWindowPos", "ptr", hwnd, "ptr", 0,
+            result := DllCall("SetWindowPos", "ptr", hwnd, "ptr", draggedHwnd,
                 "int", 0, "int", 0, "int", 0, "int", 0,
-                "uint", 0x0013, "int") ; NOMOVE|NOSIZE|NOACTIVATE
+                "uint", draggedHwnd ? 0x4013 : 0x0013, "int") ; NOMOVE|NOSIZE|NOACTIVATE; async during drag
             restored += result ? 1 : 0
         }
     }
@@ -2077,7 +2156,7 @@ RestoreWorkspaceWindowOrder(monitor, workspace) {
     return restored
 }
 
-RevealWorkspaceForHandoff(monitor, workspace, timeoutMs := 260) {
+RevealWorkspaceForHandoff(monitor, workspace, timeoutMs := 260, draggedHwnd := 0) {
     global WindowWorkspace, HiddenByScript
     expected := []
     showStartedAt := A_TickCount
@@ -2128,7 +2207,7 @@ RevealWorkspaceForHandoff(monitor, workspace, timeoutMs := 260) {
         Sleep(8)
     }
 
-    RestoreWorkspaceWindowOrder(monitor, workspace)
+    RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd)
     ; IsWindowVisible changes before every compositor surface is necessarily on
     ; screen. Two DWM presentation boundaries make the cover removal atomic to
     ; the user's eye while adding only one or two refresh intervals.
@@ -2548,6 +2627,9 @@ HandleAppExit(*) {
 }
 
 ResetAndRevealAll(*) {
+    global CarriedWorkspaceWindow
+    SetTimer(FinishWorkspaceWindowDrag, 0)
+    CarriedWorkspaceWindow := 0
     global CurrentWorkspace, WindowWorkspace, RequestedWorkspace
     global PendingWorkspaceSwitches, WorkspaceSlideSkipRequests
     global WorkspaceWindowOrders, PendingExternalActivations
@@ -3461,6 +3543,7 @@ ShowHelp(*) {
         . "Win+Ctrl+Shift+R        Restart and recover the workspace engine`n"
         . "Ctrl+Alt+Shift+R        Launch recovery even if the engine stopped`n"
         . "Win+Ctrl+Shift+Esc      Reveal everything and reset`n`n"
+        . "Hold a window by its title bar and switch workspaces to carry it with you.`n"
         . "Move the pointer to a monitor's top-left corner and hold to open the overview.`n`n"
         . "Keep Windows itself on one native virtual desktop while using this script.",
         "Independent Monitor Workspaces",

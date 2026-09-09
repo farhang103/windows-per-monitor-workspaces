@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.15 - 2026-09-08
+
+- Keep a held window visible and carry it into the selected workspace when switching during a native window drag
+- Switch instantly during dragging and restore incoming windows behind the held window without activating them
+- Finalize assignments on drop, including moves across monitors, and suppress the overview hot corner while the mouse button is held
+
 ## 1.2.14 - 2026-09-02
 
 - Added hard boundaries to previous/next workspace navigation so D3 cannot wrap to D1 and D1 cannot wrap to D3
