@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.18 - 2026-09-12
+
+- Return apps that restart within ten minutes to their previous workspace on the same monitor, including common updater version-folder changes
+- Detect replacement windows in the background and suppress initial restart focus requests without switching the user's active workspace
+- Avoid guessing when an app spans workspaces, consume one remembered assignment per replacement, and clear restart memory on reset
+- Add regression coverage for replacement handles/processes, update paths, multiple windows, ambiguity, expiry, and taskbar activation
+
 ## 1.2.17 - 2026-09-09
 
 - Animate left/right workspace switching while carrying a held window

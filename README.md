@@ -75,6 +75,10 @@ A watchdog monitors every transition. If progress pauses, it first completes the
 
 Clicking an app on the Windows taskbar also follows its workspace assignment. The utility intercepts clicks only within the taskbar's app-button area, freezes the current workspace before forwarding the click to Explorer, and hands that exact frame into the standard directional slide when the app belongs to another D-number. This prevents the app from flashing on the current workspace while preserving the same smooth D3-to-D1 motion used by the hotkeys. The correct D indicator appears, and the next previous/next shortcut continues from that workspace instead of jumping back to it. Non-taskbar activation retains an instant no-reopen fallback because Windows may reveal those windows before notifying other software.
 
+When an app closes and reopens within ten minutes on the same monitor, the utility remembers its workspace. For example, an app updating on D3 returns to D3 while you continue working on D2. Matching uses the executable's installation path and window class, allowing common `app-<version>` and WindowsApps version-folder changes. It checks for replacement windows every 250 ms and suppresses their startup focus requests for two seconds; an explicit taskbar click still follows the app to its workspace. A brief appearance before detection is possible.
+
+Restart memory lasts for the current workspace-engine session and also applies to a manual close and reopen. Each closed window allows one replacement. Apps whose matching windows belong to different workspaces, reopen on another monitor, or change their executable path or window class beyond the supported version-folder patterns use normal placement. Resetting workspaces clears restart memory.
+
 ## Workspace overview
 
 Press `Win+Ctrl+Space`, or hold the pointer in a monitor's top-left corner for half a second, to see every workspace on that monitor. The active workspace uses live window thumbnails. Inactive workspaces use snapshots captured immediately before their windows were hidden.
@@ -91,7 +95,7 @@ Preview capture is best effort. Protected, elevated, or specialized application 
 
 The app records workspace switching diagnostics in `%LOCALAPPDATA%\IndependentMonitorWorkspaces\debug.log`. Right-click its tray icon and select **Open debug log** to inspect or share it. The log includes window titles and process names so workspace assignments and focus failures can be identified. It rotates to `debug.previous.log` at 4 MB.
 
-Workspace assignments, each monitor's active D-number, and each workspace's window stack are saved in `%LOCALAPPDATA%\IndependentMonitorWorkspacesState\workspace-state.tsv`. This state survives app updates and restarts; stale windows are rejected by matching both their window handle and process ID.
+Workspace assignments, each monitor's active D-number, and each workspace's window stack are saved in `%LOCALAPPDATA%\IndependentMonitorWorkspacesState\workspace-state.tsv`. This state survives workspace-engine updates and restarts; stale windows are rejected by matching both their window handle and process ID. The short-term memory for other apps' replacement windows is kept separately in memory.
 
 ## Uninstall in one command
 

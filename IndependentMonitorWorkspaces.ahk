@@ -6,7 +6,7 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.17"
+APP_VERSION := "1.2.18"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
@@ -17,6 +17,10 @@ WORKSPACE_WATCHDOG_RESTART_MS := 4500
 
 global CurrentWorkspace := Map()
 global WindowWorkspace := Map()
+global WindowRestartIdentity := Map()
+global RecentAppWorkspaces := Map()
+global RestartActivationUntil := Map()
+APP_RESTART_MEMORY_MS := 10 * 60 * 1000
 global HiddenByScript := Map()
 global WindowSnapshots := Map()
 global WorkspaceFrames := Map()
@@ -169,6 +173,7 @@ RegisterTaskbarClickHotkeys()
 SetTimer(CheckWorkspaceOverviewHotCorner, 100)
 InstallForegroundWinEventHook()
 SetTimer(CheckExternalWorkspaceActivation, 15)
+SetTimer(CheckRestartedWorkspaceWindows, 250)
 SetTimer(CheckWorkspaceEngineHealth, 250)
 
 A_TrayMenu.Delete()
@@ -417,6 +422,7 @@ AssignCarriedWorkspaceWindow(hwnd, monitor, workspace) {
     InvalidateWorkspaceFrame(monitor, workspace)
     DeleteWindowSnapshot(hwnd)
     WindowWorkspace[hwnd] := {monitor: monitor, workspace: workspace}
+    RememberWindowRestartIdentity(hwnd)
     PromoteWorkspaceWindow(monitor, workspace, hwnd)
     ScheduleWorkspaceStateSave()
 }
@@ -551,6 +557,7 @@ MoveActiveWindowToWorkspace(workspace, *) {
     }
     InvalidateWorkspaceFrame(monitor, workspace)
     WindowWorkspace[hwnd] := {monitor: monitor, workspace: workspace}
+    RememberWindowRestartIdentity(hwnd)
     PromoteWorkspaceWindow(monitor, workspace, hwnd)
     ScheduleWorkspaceStateSave()
 
@@ -1350,6 +1357,8 @@ QueueExternalWorkspaceActivation(hwnd, source, eventTime := 0) {
     current := CurrentWorkspace[slot.monitor]
     if slot.workspace = current
         return false
+    if SuppressRestartActivation(hwnd, slot)
+        return true
     if PendingExternalActivations.Has(hwnd)
         return true
     if TaskbarActivationShields.Has(slot.monitor) {
@@ -1917,6 +1926,134 @@ SimulateTaskbarWorkspaceActivation(monitor) {
     }
 }
 
+CheckRestartedWorkspaceWindows(*) {
+    global Switching, ExternalActivationHandling, WorkspaceOverview
+    if !Switching && !ExternalActivationHandling && !WorkspaceOverview
+        LearnVisibleWindows()
+}
+
+GetWindowRestartIdentity(hwnd) {
+    try {
+        path := StrLower(WinGetProcessPath("ahk_id " hwnd))
+        className := StrLower(WinGetClass("ahk_id " hwnd))
+        if !path || !className
+            return false
+        ; Keep the installation directory and executable name. Only known
+        ; updater version components are interchangeable, never bare exe names.
+        path := RegExReplace(path, "i)\\app-\d+(?:\.\d+)+(?:-[\w.-]+)?\\", "\app-{version}\")
+        path := RegExReplace(path,
+            "i)(\\windowsapps\\[^\\]+_)\d+\.\d+\.\d+\.\d+(_[^\\]+\\)", "$1{version}$2")
+        return {key: path "|" className, pid: WinGetPID("ahk_id " hwnd)}
+    } catch
+        return false
+}
+
+RememberWindowRestartIdentity(hwnd) {
+    global WindowRestartIdentity, OverviewPreviewMode
+    if OverviewPreviewMode || WindowRestartIdentity.Has(hwnd)
+        return
+    identity := GetWindowRestartIdentity(hwnd)
+    if identity
+        WindowRestartIdentity[hwnd] := identity
+}
+
+RememberClosedAppWorkspace(hwnd) {
+    global WindowRestartIdentity, WindowWorkspace, RecentAppWorkspaces
+    if !WindowRestartIdentity.Has(hwnd) || !WindowWorkspace.Has(hwnd)
+        return
+    key := WindowRestartIdentity[hwnd].key
+    slot := WindowWorkspace[hwnd]
+    ambiguous := false
+    remaining := 1
+    if RecentAppWorkspaces.Has(key) {
+        previous := RecentAppWorkspaces[key]
+        ambiguous := previous.ambiguous || previous.monitor != slot.monitor
+            || previous.workspace != slot.workspace
+        remaining += previous.remaining
+    }
+    RecentAppWorkspaces[key] := {monitor: slot.monitor, workspace: slot.workspace,
+        closedAt: A_TickCount, ambiguous: ambiguous, remaining: remaining}
+}
+
+RefreshClosedAppWorkspaces() {
+    global WindowWorkspace, WindowRestartIdentity, RecentAppWorkspaces
+    global RestartActivationUntil, APP_RESTART_MEMORY_MS
+    for key, record in RecentAppWorkspaces.Clone() {
+        if A_TickCount - record.closedAt > APP_RESTART_MEMORY_MS
+            RecentAppWorkspaces.Delete(key)
+    }
+    for hwnd, deadline in RestartActivationUntil.Clone() {
+        if A_TickCount >= deadline
+            RestartActivationUntil.Delete(hwnd)
+    }
+    for hwnd in WindowWorkspace.Clone() {
+        alive := false
+        try alive := WinExist("ahk_id " hwnd)
+            && (!WindowRestartIdentity.Has(hwnd)
+                || WinGetPID("ahk_id " hwnd) = WindowRestartIdentity[hwnd].pid)
+        if !alive
+            ForgetWindow(hwnd)
+        else
+            RememberWindowRestartIdentity(hwnd)
+    }
+}
+
+TryRestoreRestartedWindow(hwnd, monitor) {
+    global WindowRestartIdentity, RecentAppWorkspaces, WindowWorkspace
+    global CurrentWorkspace, HiddenByScript, RestartActivationUntil, WORKSPACE_COUNT
+    if !WindowRestartIdentity.Has(hwnd)
+        return false
+    key := WindowRestartIdentity[hwnd].key
+    if !RecentAppWorkspaces.Has(key)
+        return false
+    record := RecentAppWorkspaces[key]
+    ; An app spread across desktops has no single safe destination. Also leave
+    ; placement on another physical monitor to the normal monitor-move rule.
+    if record.ambiguous || record.monitor != monitor
+        || !CurrentWorkspace.Has(monitor) || record.workspace < 1
+        || record.workspace > WORKSPACE_COUNT
+        return false
+    for otherHwnd, slot in WindowWorkspace {
+        if WindowRestartIdentity.Has(otherHwnd)
+            && WindowRestartIdentity[otherHwnd].key = key
+            && (slot.monitor != record.monitor || slot.workspace != record.workspace) {
+            record.ambiguous := true
+            return false
+        }
+    }
+    WindowWorkspace[hwnd] := {monitor: monitor, workspace: record.workspace}
+    ; One replacement per closed window; additional newly opened windows still
+    ; belong to the current workspace rather than pinning the entire app.
+    record.remaining -= 1
+    if !record.remaining
+        RecentAppWorkspaces.Delete(key)
+    InvalidateWorkspaceFrame(monitor, record.workspace)
+    PromoteWorkspaceWindow(monitor, record.workspace, hwnd)
+    if record.workspace != CurrentWorkspace[monitor] {
+        RestartActivationUntil[hwnd] := A_TickCount + 2000
+        HiddenByScript[hwnd] := true
+        HideWindowFast(hwnd)
+    }
+    DebugLog("APP_RESTART_RESTORE", "hwnd=" hwnd " monitor=" monitor
+        " workspace=D" record.workspace " key=" key)
+    return true
+}
+
+SuppressRestartActivation(hwnd, slot) {
+    global RestartActivationUntil, HiddenByScript, TaskbarActivationShields
+    if !RestartActivationUntil.Has(hwnd)
+        return false
+    ; A deliberate taskbar click takes precedence over startup focus requests.
+    if A_TickCount >= RestartActivationUntil[hwnd]
+        || TaskbarActivationShields.Has(slot.monitor) {
+        RestartActivationUntil.Delete(hwnd)
+        return false
+    }
+    HiddenByScript[hwnd] := true
+    HideWindowFast(hwnd)
+    return true
+}
+
 LearnVisibleWindows() {
     global CurrentWorkspace, WindowWorkspace, HiddenByScript
     global OverviewPreviewMode
@@ -1928,6 +2065,8 @@ LearnVisibleWindows() {
         DebugLog("WINDOW_SCAN_SKIP", "reason=preview-mode tracked=" WindowWorkspace.Count)
         return
     }
+
+    RefreshClosedAppWorkspaces()
 
     learned := 0
     moved := 0
@@ -1941,6 +2080,11 @@ LearnVisibleWindows() {
 
         monitor := GetWindowMonitor(hwnd)
         if !WindowWorkspace.Has(hwnd) {
+            RememberWindowRestartIdentity(hwnd)
+            if TryRestoreRestartedWindow(hwnd, monitor) {
+                learned += 1
+                continue
+            }
             WindowWorkspace[hwnd] := {
                 monitor: monitor,
                 workspace: CurrentWorkspace[monitor]
@@ -1968,10 +2112,11 @@ LearnVisibleWindows() {
                 " toWorkspace=D" CurrentWorkspace[monitor] " " DebugDescribeWindow(hwnd))
         }
     }
-    DebugLog("WINDOW_SCAN_END", "learned=" learned " moved=" moved
-        " tracked=" WindowWorkspace.Count " scriptHidden=" HiddenByScript.Count)
-    if learned || moved
+    if learned || moved {
+        DebugLog("WINDOW_SCAN_END", "learned=" learned " moved=" moved
+            " tracked=" WindowWorkspace.Count " scriptHidden=" HiddenByScript.Count)
         ScheduleWorkspaceStateSave()
+    }
 }
 
 IsManageableWindow(hwnd) {
@@ -2600,6 +2745,12 @@ ResumePendingWorkspaceRecovery() {
 
 ForgetWindow(hwnd) {
     global WindowWorkspace, HiddenByScript
+    global WindowRestartIdentity, RestartActivationUntil
+    RememberClosedAppWorkspace(hwnd)
+    if WindowRestartIdentity.Has(hwnd)
+        WindowRestartIdentity.Delete(hwnd)
+    if RestartActivationUntil.Has(hwnd)
+        RestartActivationUntil.Delete(hwnd)
     if WindowWorkspace.Has(hwnd) {
         slot := WindowWorkspace[hwnd]
         InvalidateWorkspaceFrame(slot.monitor, slot.workspace)
@@ -2653,6 +2804,10 @@ HandleAppExit(*) {
 }
 
 ResetAndRevealAll(*) {
+    global WindowRestartIdentity, RecentAppWorkspaces, RestartActivationUntil
+    WindowRestartIdentity.Clear()
+    RecentAppWorkspaces.Clear()
+    RestartActivationUntil.Clear()
     global CarriedWorkspaceWindow
     SetTimer(FinishWorkspaceWindowDrag, 0)
     CarriedWorkspaceWindow := 0
