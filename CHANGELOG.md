@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.19 - 2026-09-20
+
+- Prevent overlapping desktop-indicator updates from leaving a stale D-number permanently visible
+- Tie dismissal callbacks to their own indicator and remove expired or incorrect labels during health checks
+- Clear indicators on reset and shutdown; add native-window regression coverage for overlapping updates and cleanup
+
 ## 1.2.18 - 2026-09-12
 
 - Return apps that restart within ten minutes to their previous workspace on the same monitor, including common updater version-folder changes

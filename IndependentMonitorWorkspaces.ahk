@@ -6,7 +6,7 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.18"
+APP_VERSION := "1.2.19"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
@@ -2609,6 +2609,7 @@ CheckWorkspaceEngineHealth(*) {
     global PendingWorkspaceSwitches, RequestedWorkspace, WorkspaceSlideSkipRequests
     global WorkspaceRestartScheduled
 
+    CheckWorkspaceOverlayHealth()
     if WorkspaceRestartScheduled
         return
     if !Switching {
@@ -2797,6 +2798,7 @@ HandleAppExit(*) {
     ClearTaskbarActivationShields("app-exit")
     SaveWorkspaceState()
     CloseWorkspaceOverview(false)
+    ClearWorkspaceOverlays()
     RestoreAllWindows()
     ClearWindowSnapshots()
     ClearWorkspaceFrames()
@@ -2815,6 +2817,7 @@ ResetAndRevealAll(*) {
     global PendingWorkspaceSwitches, WorkspaceSlideSkipRequests
     global WorkspaceWindowOrders, PendingExternalActivations
     DebugLog("RESET", "begin")
+    ClearWorkspaceOverlays()
     ClearTaskbarActivationShields("reset")
     CloseWorkspaceOverview(false)
     RestoreAllWindows()
@@ -3262,6 +3265,19 @@ ShowWorkspaceOverlay(monitor, workspace, direction := 0) {
     if !SHOW_FEEDBACK
         return
 
+    ; Creating/showing a GUI pumps messages. A second update must not run
+    ; between cancelling the old indicator and publishing its replacement,
+    ; or the first GUI loses its owner and can remain visible indefinitely.
+    previousCritical := Critical("On")
+    try {
+        CreateWorkspaceOverlay(monitor, workspace, direction)
+    } finally {
+        Critical(previousCritical)
+    }
+}
+
+CreateWorkspaceOverlay(monitor, workspace, direction) {
+    global INDICATOR_MS, WorkspaceOverlays
     DebugLog("OVERLAY_SHOW", "monitor=" monitor " workspace=D" workspace
         " direction=" direction)
     CancelWorkspaceOverlay(monitor)
@@ -3280,19 +3296,23 @@ ShowWorkspaceOverlay(monitor, workspace, direction := 0) {
     overlay.SetFont("s18 cFFFFFF w600", "Segoe UI")
     overlay.AddText("x0 y0 w78 h44 Center +0x200 BackgroundTrans", label)
 
-    overlay.Show("NA x" targetX " y" targetY " w" width " h" height)
     hwnd := overlay.Hwnd
-    try WinSetRegion("0-0 W" width " H" height " R12-12", "ahk_id " hwnd)
-    try WinSetTransparent(238, "ahk_id " hwnd)
-
     state := {
         gui: overlay, hwnd: hwnd, monitor: monitor,
         workspace: workspace,
-        targetX: targetX, y: targetY
+        targetX: targetX, y: targetY, expiresAt: A_TickCount + INDICATOR_MS
     }
-    state.dismissTimer := CancelWorkspaceOverlay.Bind(monitor)
+    state.dismissTimer := CancelWorkspaceOverlay.Bind(monitor, state)
     WorkspaceOverlays[monitor] := state
-    SetTimer(state.dismissTimer, -INDICATOR_MS)
+    try {
+        SetTimer(state.dismissTimer, -INDICATOR_MS)
+        overlay.Show("NA x" targetX " y" targetY " w" width " h" height)
+        try WinSetRegion("0-0 W" width " H" height " R12-12", "ahk_id " hwnd)
+        try WinSetTransparent(238, "ahk_id " hwnd)
+    } catch as error {
+        CancelWorkspaceOverlay(monitor, state)
+        throw error
+    }
 }
 
 AnimateWorkspaceOverlay(state) {
@@ -3342,12 +3362,24 @@ FadeWorkspaceOverlay(state) {
     }
 }
 
-CancelWorkspaceOverlay(monitor) {
+CancelWorkspaceOverlay(monitor, expectedState := false) {
+    previousCritical := Critical("On")
+    try {
+        DestroyWorkspaceOverlay(monitor, expectedState)
+    } finally {
+        Critical(previousCritical)
+    }
+}
+
+DestroyWorkspaceOverlay(monitor, expectedState := false) {
     global WorkspaceOverlays
     if !WorkspaceOverlays.Has(monitor)
         return
 
     state := WorkspaceOverlays[monitor]
+    ; A delayed callback belongs to one instance, never its replacement.
+    if expectedState && state != expectedState
+        return
     ; Relinquish ownership before stopping timers or destroying the GUI. Those
     ; operations can dispatch pending timer/window messages re-entrantly; any
     ; duplicate cancellation must see that this overlay is already gone.
@@ -3356,11 +3388,35 @@ CancelWorkspaceOverlay(monitor) {
         " hwnd=" state.hwnd)
     if state.HasOwnProp("moveTimer")
         try SetTimer(state.moveTimer, 0)
-    if state.HasOwnProp("dismissTimer")
+    if state.HasOwnProp("dismissTimer") {
         try SetTimer(state.dismissTimer, 0)
+        ; The callback holds this state; release the reverse reference too.
+        state.DeleteProp("dismissTimer")
+    }
     if state.HasOwnProp("fadeTimer")
         try SetTimer(state.fadeTimer, 0)
+    try state.gui.Hide()
     try state.gui.Destroy()
+    catch as error {
+        DebugLog("OVERLAY_DESTROY_ERROR", "monitor=" monitor
+            " hwnd=" state.hwnd " message=" DebugClean(error.Message))
+    }
+}
+
+CheckWorkspaceOverlayHealth() {
+    global WorkspaceOverlays, CurrentWorkspace
+    for monitor, state in WorkspaceOverlays.Clone() {
+        if A_TickCount >= state.expiresAt
+            || !CurrentWorkspace.Has(monitor)
+            || CurrentWorkspace[monitor] != state.workspace
+            CancelWorkspaceOverlay(monitor, state)
+    }
+}
+
+ClearWorkspaceOverlays() {
+    global WorkspaceOverlays
+    for monitor, state in WorkspaceOverlays.Clone()
+        CancelWorkspaceOverlay(monitor, state)
 }
 
 ShowFeedbackForMonitor(monitor, workspace, *) {
