@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.20 - 2026-10-23
+
+- Prevent an app that stops responding from freezing the whole workspace engine, including its watchdog and hotkeys
+- Check each app's UI thread before window captures, focus restores, and stack reordering; capture hung windows from the screen and post requests to them instead of waiting
+- Skip snapshots of windows that are not on screen
+- Stop restarts from popping up windows their own apps had hidden, such as tray apps, popups, and tooltips, or treating them as hidden by the engine
+- Release windows that an app keeps hidden after a visit, so switches no longer wait on them until timing out
+- Rotate the debug log during long sessions instead of only at startup
+- Add hung-app and self-hidden-window regression tests, and fix test wrappers under Windows PowerShell 5.1
+
 ## 1.2.19 - 2026-09-20
 
 - Prevent overlapping desktop-indicator updates from leaving a stale D-number permanently visible

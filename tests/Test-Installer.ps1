@@ -95,9 +95,11 @@ try {
     Assert-Equal $installedRuntime $metadata.AutoHotkeyPath 'Install metadata runtime path'
 
     Write-Host 'Testing bounded previous/next navigation...' -ForegroundColor Cyan
-    & $installedRuntime /ErrorStdOut $installedScript --navigation-self-test
-    & (Join-Path $PSScriptRoot 'Test-FullscreenOverview.ps1') -AutoHotkeyPath $installedRuntime
+    # AutoHotkey is a GUI program; piping its output makes PowerShell wait for
+    # it and record the exit code.
+    & $installedRuntime /ErrorStdOut $installedScript --navigation-self-test | Out-Host
     Assert-Equal 0 $LASTEXITCODE 'Navigation boundary self-test exit code'
+    & (Join-Path $PSScriptRoot 'Test-FullscreenOverview.ps1') -AutoHotkeyPath $installedRuntime
 
     $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
     Assert-Equal $installedRuntime $shortcut.TargetPath 'Startup shortcut target'

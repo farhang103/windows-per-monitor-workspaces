@@ -2,9 +2,13 @@
 [CmdletBinding()]
 param(
     [string]$AutoHotkeyPath = "$env:LOCALAPPDATA\IndependentMonitorWorkspaces\runtime\AutoHotkey.exe",
-    [string]$SourceScriptPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'IndependentMonitorWorkspaces.ahk')
+    [string]$SourceScriptPath
 )
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 has no $PSScriptRoot while binding parameter defaults.
+if (-not $SourceScriptPath) {
+    $SourceScriptPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'IndependentMonitorWorkspaces.ahk'
+}
 $source = Get-Content -LiteralPath $SourceScriptPath -Raw
 $globals = $source.Substring(0, $source.IndexOf('DetectHiddenWindows true'))
 $functions = $source.Substring($source.IndexOf("`nInitializeMonitors() {"))
@@ -97,6 +101,9 @@ try {
         -ArgumentList @('/ErrorStdOut', ('"' + $testScript + '"')) `
         -RedirectStandardOutput (Join-Path $testRoot 'stdout.txt') `
         -RedirectStandardError (Join-Path $testRoot 'stderr.txt')
+    # Windows PowerShell 5.1 reports no exit code unless the handle is opened
+    # while the process is still running.
+    $null = $process.Handle
     if (-not $process.WaitForExit(15000)) {
         $process.Kill()
         throw 'Overlay tests timed out.'

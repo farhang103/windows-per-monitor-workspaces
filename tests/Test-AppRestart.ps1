@@ -201,6 +201,9 @@ try {
         -ArgumentList @('/ErrorStdOut', ('"' + $testScript + '"')) `
         -RedirectStandardOutput (Join-Path $testRoot 'stdout.txt') `
         -RedirectStandardError (Join-Path $testRoot 'stderr.txt')
+    # Windows PowerShell 5.1 reports no exit code unless the handle is opened
+    # while the process is still running.
+    $null = $result.Handle
     if (-not $result.WaitForExit(15000)) {
         $result.Kill()
         throw 'App restart tests timed out.'

@@ -6,7 +6,7 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.19"
+APP_VERSION := "1.2.20"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
@@ -22,6 +22,7 @@ global RecentAppWorkspaces := Map()
 global RestartActivationUntil := Map()
 APP_RESTART_MEMORY_MS := 10 * 60 * 1000
 global HiddenByScript := Map()
+global RestoredSelfHiddenWindows := Map()
 global WindowSnapshots := Map()
 global WorkspaceFrames := Map()
 global WorkspaceWindowOrders := Map()
@@ -1052,11 +1053,15 @@ ActivateOverviewWindow(hwnd, monitor, workspace, attempt := 0) {
     catch
         minimized := false
     ; A direct restore/show is intentional here: clicking a preview means the
-    ; user explicitly wants that exact window in the foreground.
-    try DllCall("ShowWindow", "ptr", hwnd, "int", minimized ? 9 : 5)
-    if minimized
-        try WinRestore("ahk_id " hwnd)
-    try WinActivate("ahk_id " hwnd)
+    ; user explicitly wants that exact window in the foreground. A hung app
+    ; gets the same request posted, so it cannot freeze the engine.
+    if IsWindowResponsive(hwnd) {
+        try DllCall("ShowWindow", "ptr", hwnd, "int", minimized ? 9 : 5)
+        if minimized
+            try WinRestore("ahk_id " hwnd)
+        try WinActivate("ahk_id " hwnd)
+    } else
+        try DllCall("ShowWindowAsync", "ptr", hwnd, "int", minimized ? 9 : 5)
     try DllCall("SetForegroundWindow", "ptr", hwnd)
 
     ; Focusing some applications can briefly cover a newly created overlay.
@@ -1576,7 +1581,7 @@ RaiseWorkspacePriorityWindow(hwnd) {
         return false
     try return DllCall("SetWindowPos", "ptr", hwnd, "ptr", 0,
         "int", 0, "int", 0, "int", 0, "int", 0,
-        "uint", 0x0013, "int") != 0 ; NOMOVE|NOSIZE|NOACTIVATE
+        "uint", IsWindowResponsive(hwnd) ? 0x0013 : 0x4013, "int") != 0 ; NOMOVE|NOSIZE|NOACTIVATE; ASYNCWINDOWPOS if hung
     catch
         return false
 }
@@ -2212,6 +2217,25 @@ ShowWindowFast(hwnd) {
     }
 }
 
+IsWindowResponsive(hwnd, timeoutMs := 100) {
+    ; PrintWindow, ShowWindow and synchronous SetWindowPos wait for the owning
+    ; UI thread with no timeout. One hung app would otherwise block this
+    ; script's only thread, including the watchdog meant to recover it.
+    ownerThread := DllCall("GetWindowThreadProcessId", "ptr", hwnd, "ptr", 0, "uint")
+    if !ownerThread
+        return false
+    if ownerThread = DllCall("GetCurrentThreadId", "uint")
+        return true
+    result := 0
+    ; WM_NULL with SMTO_ABORTIFHUNG returns at once for a window Windows
+    ; already reports as hung, and after timeoutMs for one that just stalled.
+    try return DllCall("SendMessageTimeout", "ptr", hwnd, "uint", 0,
+        "ptr", 0, "ptr", 0, "uint", 0x0002, "uint", timeoutMs,
+        "uptr*", &result, "ptr") != 0
+    catch
+        return false
+}
+
 WorkspaceWindowOrderKey(monitor, workspace) {
     return monitor ":" workspace
 }
@@ -2314,10 +2338,12 @@ RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd := 0) {
             continue
         if !WinExist("ahk_id " hwnd) || !IsVisible(hwnd)
             continue
+        ; Post the reorder during a drag or to a hung app instead of waiting.
+        postReorder := draggedHwnd || !IsWindowResponsive(hwnd)
         try {
             result := DllCall("SetWindowPos", "ptr", hwnd, "ptr", draggedHwnd,
                 "int", 0, "int", 0, "int", 0, "int", 0,
-                "uint", draggedHwnd ? 0x4013 : 0x0013, "int") ; NOMOVE|NOSIZE|NOACTIVATE; async during drag
+                "uint", postReorder ? 0x4013 : 0x0013, "int") ; NOMOVE|NOSIZE|NOACTIVATE; optional ASYNCWINDOWPOS
             restored += result ? 1 : 0
         }
     }
@@ -2456,8 +2482,12 @@ CaptureWindowSnapshot(hwnd, allowScreenCapture := true) {
 
     oldBitmap := DllCall("SelectObject", "ptr", memoryDc, "ptr", bitmap, "ptr")
     captured := false
-    try captured := DllCall("PrintWindow", "ptr", hwnd, "ptr", memoryDc, "uint", 2, "int") != 0
-    if !captured && allowScreenCapture {
+    if IsWindowResponsive(hwnd) {
+        try captured := DllCall("PrintWindow", "ptr", hwnd, "ptr", memoryDc, "uint", 2, "int") != 0
+    } else
+        DebugLog("SNAPSHOT_PRINT_SKIP", "reason=unresponsive " DebugDescribeWindow(hwnd))
+    ; The screen only holds this window's pixels while it is shown.
+    if !captured && allowScreenCapture && IsVisible(hwnd) {
         captured := DllCall("BitBlt", "ptr", memoryDc,
             "int", 0, "int", 0, "int", width, "int", height,
             "ptr", screenDc, "int", left, "int", top, "uint", 0x00CC0020, "int") != 0
@@ -2923,7 +2953,9 @@ RefreshWorkspaceWindowSnapshots(monitor, workspace, excludedHwnd := 0) {
     for hwnd in windows {
         if hwnd = excludedHwnd
             continue
-        if !WinExist("ahk_id " hwnd)
+        ; Only on-screen windows can change; a window hidden by its own app
+        ; has nothing to capture.
+        if !WinExist("ahk_id " hwnd) || !IsVisible(hwnd)
             continue
         try minimized := WinGetMinMax("ahk_id " hwnd) = -1
         catch
@@ -3438,7 +3470,7 @@ ScheduleWorkspaceStateSave(*) {
 
 SaveWorkspaceState(*) {
     global CurrentWorkspace, WindowWorkspace, WORKSPACE_STATE_PATH, WORKSPACE_COUNT
-    global WorkspaceStatePersistenceEnabled, WorkspaceWindowOrders
+    global WorkspaceStatePersistenceEnabled, WorkspaceWindowOrders, HiddenByScript
     if !WorkspaceStatePersistenceEnabled
         return
     try {
@@ -3467,8 +3499,11 @@ SaveWorkspaceState(*) {
             try pid := WinGetPID("ahk_id " hwnd)
             catch
                 continue
+            ; 0 marks a window its own app hid (tray apps, popups), which a
+            ; restart must neither show nor treat as hidden by this script.
+            shown := IsVisible(hwnd) || HiddenByScript.Has(hwnd) ? 1 : 0
             contents .= "W`t" hwnd "`t" pid "`t" MonitorGetName(slot.monitor)
-                . "`t" slot.workspace "`n"
+                . "`t" slot.workspace "`t" shown "`n"
             savedWindows += 1
         }
 
@@ -3506,7 +3541,7 @@ SaveWorkspaceState(*) {
 
 LoadWorkspaceState() {
     global CurrentWorkspace, WindowWorkspace, WORKSPACE_STATE_PATH, WORKSPACE_COUNT
-    global WorkspaceWindowOrders
+    global WorkspaceWindowOrders, RestoredSelfHiddenWindows
     if !FileExist(WORKSPACE_STATE_PATH) {
         DebugLog("STATE_LOAD", "result=missing path=" WORKSPACE_STATE_PATH)
         return false
@@ -3578,6 +3613,8 @@ LoadWorkspaceState() {
             expectedPid := Integer(fields[3])
             deviceName := StrLower(fields[4])
             workspace := Integer(fields[5])
+            ; Older state files have no flag; keep their show-everything rule.
+            shown := fields.Length >= 6 ? Integer(fields[6]) : 1
         } catch {
             rejectedWindows += 1
             continue
@@ -3598,9 +3635,11 @@ LoadWorkspaceState() {
         }
         monitor := monitorLookup[deviceName]
         WindowWorkspace[hwnd] := {monitor: monitor, workspace: workspace}
+        if !shown
+            RestoredSelfHiddenWindows[hwnd] := true
         restoredWindows += 1
         DebugLog("STATE_WINDOW_RESTORE", "monitor=" monitor " workspace=D" workspace
-            " " DebugDescribeWindow(hwnd))
+            " shown=" shown " " DebugDescribeWindow(hwnd))
     }
 
     DebugLog("STATE_LOAD", "result=ok monitors=" restoredMonitors
@@ -3630,7 +3669,7 @@ IsIgnoredPersistedWindow(hwnd) {
 }
 
 ApplyRestoredWorkspaceVisibility() {
-    global CurrentWorkspace, WindowWorkspace, HiddenByScript
+    global CurrentWorkspace, WindowWorkspace, HiddenByScript, RestoredSelfHiddenWindows
     applied := 0
     for hwnd, slot in WindowWorkspace.Clone() {
         if !WinExist("ahk_id " hwnd) {
@@ -3639,6 +3678,13 @@ ApplyRestoredWorkspaceVisibility() {
         }
         if !CurrentWorkspace.Has(slot.monitor)
             continue
+        ; Still hidden by its own app: showing it would pop it up now, and
+        ; marking it script-hidden would pop it up on the next visit.
+        if RestoredSelfHiddenWindows.Has(hwnd) && !IsVisible(hwnd) {
+            DebugLog("STATE_APPLY_SELF_HIDDEN", "assigned=D" slot.workspace
+                " " DebugDescribeWindow(hwnd))
+            continue
+        }
         expectedVisible := slot.workspace = CurrentWorkspace[slot.monitor]
         if expectedVisible {
             if !IsVisible(hwnd) {
@@ -3659,33 +3705,50 @@ ApplyRestoredWorkspaceVisibility() {
         }
         applied += 1
     }
+    RestoredSelfHiddenWindows.Clear()
     DebugLog("STATE_APPLY", "windows=" applied)
     Loop MonitorGetCount()
         SetTimer(VerifyWorkspaceTransition.Bind(A_Index, CurrentWorkspace[A_Index], 0), -300)
 }
 
 InitializeDebugLogging() {
-    global DEBUG_LOG_PATH, DEBUG_PREVIOUS_LOG_PATH, DEBUG_MAX_BYTES, DEBUG_SESSION_ID
+    global DEBUG_LOG_PATH, DEBUG_SESSION_ID
     try {
         SplitPath(DEBUG_LOG_PATH,, &logDirectory)
         DirCreate(logDirectory)
-        if FileExist(DEBUG_LOG_PATH) && FileGetSize(DEBUG_LOG_PATH) >= DEBUG_MAX_BYTES {
-            if FileExist(DEBUG_PREVIOUS_LOG_PATH)
-                FileDelete(DEBUG_PREVIOUS_LOG_PATH)
-            FileMove(DEBUG_LOG_PATH, DEBUG_PREVIOUS_LOG_PATH, true)
-        }
+        RotateDebugLogIfNeeded()
         FileAppend("`n===== SESSION " DEBUG_SESSION_ID " =====`n", DEBUG_LOG_PATH, "UTF-8")
     }
 }
 
+RotateDebugLogIfNeeded() {
+    global DEBUG_LOG_PATH, DEBUG_PREVIOUS_LOG_PATH, DEBUG_MAX_BYTES
+    if !FileExist(DEBUG_LOG_PATH) || FileGetSize(DEBUG_LOG_PATH) < DEBUG_MAX_BYTES
+        return false
+    if FileExist(DEBUG_PREVIOUS_LOG_PATH)
+        FileDelete(DEBUG_PREVIOUS_LOG_PATH)
+    FileMove(DEBUG_LOG_PATH, DEBUG_PREVIOUS_LOG_PATH, true)
+    return true
+}
+
 DebugLog(event, details := "") {
     global DEBUG_LOG_PATH, DEBUG_SESSION_ID
+    ; The engine runs for days, so rotating only at startup let one session
+    ; grow the log far past its limit.
+    static linesSinceSizeCheck := 0
     try {
         timestamp := FormatTime(, "yyyy-MM-dd HH:mm:ss") "." Format("{:03}", A_MSec)
         line := timestamp " [" DEBUG_SESSION_ID "] [" event "]"
         if details != ""
             line .= " " DebugClean(details)
         FileAppend(line "`n", DEBUG_LOG_PATH, "UTF-8")
+        linesSinceSizeCheck += 1
+        if linesSinceSizeCheck >= 500 {
+            linesSinceSizeCheck := 0
+            if RotateDebugLogIfNeeded()
+                FileAppend("===== SESSION " DEBUG_SESSION_ID " (continued) =====`n",
+                    DEBUG_LOG_PATH, "UTF-8")
+        }
     }
 }
 
@@ -3757,15 +3820,28 @@ DebugWorkspaceSummary(monitor) {
 }
 
 VerifyWorkspaceTransition(monitor, workspace, attempt := 0) {
-    global CurrentWorkspace, WindowWorkspace, HiddenByScript
+    global CurrentWorkspace, WindowWorkspace, HiddenByScript, Switching
     mismatchCount := 0
     mismatchDetails := ""
+    released := 0
     for hwnd, slot in WindowWorkspace {
         if slot.monitor != monitor || !WinExist("ahk_id " hwnd)
             continue
         expectedVisible := slot.workspace = workspace
         actualVisible := IsVisible(hwnd)
         scriptHidden := HiddenByScript.Has(hwnd)
+        ; A responsive app still keeping its window hidden a second after the
+        ; show request hid it itself. Stop re-showing it on every visit, where
+        ; each handoff would otherwise wait for it until timing out.
+        if attempt >= 3 && expectedVisible && !actualVisible && scriptHidden
+            && !Switching && CurrentWorkspace.Has(monitor)
+            && CurrentWorkspace[monitor] = workspace && IsWindowResponsive(hwnd) {
+            HiddenByScript.Delete(hwnd)
+            released += 1
+            DebugLog("WINDOW_SELF_HIDDEN_RELEASE", "workspace=D" workspace
+                " " DebugDescribeWindow(hwnd))
+            continue
+        }
         if expectedVisible != actualVisible {
             mismatchCount += 1
             if mismatchCount <= 12
@@ -3779,6 +3855,8 @@ VerifyWorkspaceTransition(monitor, workspace, attempt := 0) {
         " expected=D" workspace " actual=" actualWorkspace
         " mismatches=" mismatchCount " active=" DebugDescribeWindow(WinExist("A"))
         mismatchDetails)
+    if released
+        ScheduleWorkspaceStateSave()
     if mismatchCount && attempt < 3
         SetTimer(VerifyWorkspaceTransition.Bind(monitor, workspace, attempt + 1), -250)
 }
