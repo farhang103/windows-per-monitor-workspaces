@@ -37,11 +37,12 @@ TestSelfHiddenWindows() {
     global WORKSPACE_STATE_PATH
     InitializeMonitors()
     monitor := MonitorGetPrimary()
-    shown := Gui("-Caption +ToolWindow -DPIScale")
-    trayApp := Gui("-Caption +ToolWindow -DPIScale")
-    parked := Gui("-Caption +ToolWindow -DPIScale")
-    popup := Gui("-Caption +ToolWindow -DPIScale")
-    legacy := Gui("-Caption +ToolWindow -DPIScale")
+    ; Ordinary app windows: the engine leaves tool windows to their app.
+    shown := Gui("-Caption -DPIScale")
+    trayApp := Gui("-Caption -DPIScale")
+    parked := Gui("-Caption -DPIScale")
+    popup := Gui("-Caption -DPIScale")
+    legacy := Gui("-Caption -DPIScale")
     try {
         shown.Show("NA x40 y40 w160 h120")
         CurrentWorkspace[monitor] := 1

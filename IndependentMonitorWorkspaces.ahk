@@ -6,7 +6,7 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.20"
+APP_VERSION := "1.2.21"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
@@ -56,6 +56,7 @@ global CarriedWorkspaceWindow := 0
 global DEBUG_LOG_PATH := GetWorkspaceStoragePath("debug.log")
 global DEBUG_PREVIOUS_LOG_PATH := GetWorkspaceStoragePath("debug.previous.log")
 global DEBUG_MAX_BYTES := 4 * 1024 * 1024
+global DebugLogFile := false
 global DEBUG_SESSION_ID := FormatTime(, "yyyyMMdd-HHmmss") "-" DllCall("GetCurrentProcessId", "uint")
 global WORKSPACE_STATE_PATH := GetWorkspaceStoragePath("workspace-state.tsv", true)
 global WORKSPACE_RECOVERY_PATH := GetWorkspaceStoragePath("pending-recovery.tsv", true)
@@ -1592,6 +1593,10 @@ ResolveTrackedWorkspaceWindow(hwnd) {
         return 0
     if WindowWorkspace.Has(hwnd)
         return hwnd
+    ; A focused toolbar or overlay stays where it is on screen. Following it
+    ; to its app's workspace made clicking a share toolbar switch the monitor.
+    if !IsWorkspaceWindowKind(hwnd)
+        return 0
     for ancestorMode in [2, 3] { ; GA_ROOT, GA_ROOTOWNER
         try ancestor := DllCall("GetAncestor", "ptr", hwnd, "uint", ancestorMode, "ptr")
         catch
@@ -1957,6 +1962,11 @@ RememberWindowRestartIdentity(hwnd) {
     global WindowRestartIdentity, OverviewPreviewMode
     if OverviewPreviewMode || WindowRestartIdentity.Has(hwnd)
         return
+    ; Only an app's top-level windows come back after a restart. Its dialogs
+    ; and popups share its executable and often its class, so a new one opened
+    ; on this workspace was hidden as the "restart" of one closed on another.
+    if DllCall("GetWindow", "ptr", hwnd, "uint", 4, "ptr") ; GW_OWNER
+        return
     identity := GetWindowRestartIdentity(hwnd)
     if identity
         WindowRestartIdentity[hwnd] := identity
@@ -2080,7 +2090,9 @@ LearnVisibleWindows() {
             continue
         if HiddenByScript.Has(hwnd)
             continue
-        if !IsManageableWindow(hwnd) || !IsVisible(hwnd)
+        ; Most of the system's windows are hidden. Rule those out before the
+        ; process and style lookups, since this scan repeats every 250 ms.
+        if !IsVisible(hwnd) || !IsManageableWindow(hwnd)
             continue
 
         monitor := GetWindowMonitor(hwnd)
@@ -2140,36 +2152,9 @@ IsManageableWindow(hwnd) {
     try class := WinGetClass("ahk_id " hwnd)
     catch
         return false
-
-    static ignoredClasses := Map(
-        "Shell_TrayWnd", true,
-        "Shell_SecondaryTrayWnd", true,
-        "Progman", true,
-        "WorkerW", true,
-        "DV2ControlHost", true,
-        "MsgrIMEWindowClass", true,
-        "SysShadow", true,
-        "Windows.UI.Core.CoreWindow", true,
-        "EdgeUiInputTopWndClass", true,
-        "XamlExplorerHostIslandWindow_WASDK", true,
-        "RaycastUIAccessHelper", true,
-        "RaycastNodeGracefulShutdownClass", true,
-        "AutoHotkeyGUI", true
-    )
-    if ignoredClasses.Has(class)
+    if class = "AutoHotkeyGUI"
         return false
-
-    ; Windows Widgets exposes a browser-class helper window, but it is a shell
-    ; surface rather than a workspace app.
-    try processName := WinGetProcessName("ahk_id " hwnd)
-    catch
-        processName := ""
-    try title := WinGetTitle("ahk_id " hwnd)
-    catch
-        title := ""
-    if StrLower(processName) = "msedgewebview2.exe" && title = "Widgets"
-        return false
-    if StrLower(processName) = "raycast.exe"
+    if !IsWorkspaceWindowKind(hwnd)
         return false
 
     ; Do not adopt windows hidden by their own application. Windows already
@@ -2185,6 +2170,77 @@ IsManageableWindow(hwnd) {
     }
 
     return true
+}
+
+IsWorkspaceWindowKind(hwnd) {
+    global WindowWorkspace
+    try class := WinGetClass("ahk_id " hwnd)
+    catch
+        return false
+    static ignoredClasses := Map(
+        "Shell_TrayWnd", true,
+        "Shell_SecondaryTrayWnd", true,
+        "Progman", true,
+        "WorkerW", true,
+        "DV2ControlHost", true,
+        "MsgrIMEWindowClass", true,
+        "SysShadow", true,
+        "Windows.UI.Core.CoreWindow", true,
+        "EdgeUiInputTopWndClass", true,
+        "XamlExplorerHostIslandWindow", true,
+        "XamlExplorerHostIslandWindow_WASDK", true,
+        "Xaml_WindowedPopupClass", true,
+        "tooltips_class32", true,
+        "#32768", true, ; menus
+        "SysDragImage", true,
+        "RaycastUIAccessHelper", true,
+        "RaycastNodeGracefulShutdownClass", true
+    )
+    if ignoredClasses.Has(class)
+        return false
+
+    ; Windows Widgets exposes a browser-class helper window, but it is a shell
+    ; surface rather than a workspace app. Zoom draws its screen-sharing
+    ; borders and indicators from CptHost.exe.
+    try processName := StrLower(WinGetProcessName("ahk_id " hwnd))
+    catch
+        processName := ""
+    if processName = "raycast.exe" || processName = "cpthost.exe"
+        return false
+    if processName = "msedgewebview2.exe" {
+        try title := WinGetTitle("ahk_id " hwnd)
+        catch
+            title := ""
+        if title = "Widgets"
+            return false
+    }
+
+    ; Workspaces hold the windows Windows lists on the taskbar and in Alt+Tab,
+    ; plus their dialogs. On-screen displays, tray flyouts, notifications and
+    ; meeting or screen-sharing overlays come and go on their app's schedule:
+    ; hiding one during a switch and re-showing it on the next visit left it
+    ; stuck on screen, and focusing one jumped the monitor to the workspace
+    ; that happened to be showing when it first appeared.
+    try exStyle := WinGetExStyle("ahk_id " hwnd)
+    catch
+        return false
+    if exStyle & 0x20 ; WS_EX_TRANSPARENT
+        return false
+    if exStyle & 0x40000 ; WS_EX_APPWINDOW
+        return true
+    if exStyle & 0x08000000 ; WS_EX_NOACTIVATE
+        return false
+    if !(exStyle & 0x80) ; WS_EX_TOOLWINDOW
+        return true
+    ; An app's own palettes and drawn frame shadows still follow it, because
+    ; hiding the app does not hide the windows it owns.
+    if exStyle & 0x8 ; WS_EX_TOPMOST
+        return false
+    try owner := DllCall("GetAncestor", "ptr", hwnd, "uint", 3, "ptr") ; GA_ROOTOWNER
+    catch
+        return false
+    return owner && owner != hwnd && WindowWorkspace.Has(owner)
+        && IsWorkspaceWindowKind(owner)
 }
 
 IsVisible(hwnd) {
@@ -3629,7 +3685,7 @@ LoadWorkspaceState() {
             rejectedWindows += 1
             continue
         }
-        if actualPid != expectedPid || IsIgnoredPersistedWindow(hwnd) {
+        if actualPid != expectedPid {
             rejectedWindows += 1
             continue
         }
@@ -3642,30 +3698,26 @@ LoadWorkspaceState() {
             " shown=" shown " " DebugDescribeWindow(hwnd))
     }
 
+    ; Release popups and overlays saved by older versions. Checked once every
+    ; window is loaded, since a palette counts only while its owner is tracked.
+    ; They are left as they are: showing one could bring back a finished popup.
+    for hwnd in WindowWorkspace.Clone() {
+        if IsWorkspaceWindowKind(hwnd)
+            continue
+        DebugLog("STATE_WINDOW_RELEASE", "reason=not-a-workspace-window "
+            DebugDescribeWindow(hwnd))
+        ForgetWindow(hwnd)
+        if RestoredSelfHiddenWindows.Has(hwnd)
+            RestoredSelfHiddenWindows.Delete(hwnd)
+        restoredWindows -= 1
+        rejectedWindows += 1
+    }
+
     DebugLog("STATE_LOAD", "result=ok monitors=" restoredMonitors
         " windows=" restoredWindows " rejected=" rejectedWindows
         " orderEntries=" restoredOrderEntries
         " path=" WORKSPACE_STATE_PATH)
     return restoredMonitors || restoredWindows
-}
-
-IsIgnoredPersistedWindow(hwnd) {
-    try className := WinGetClass("ahk_id " hwnd)
-    catch
-        return true
-    if className = "EdgeUiInputTopWndClass"
-        || className = "XamlExplorerHostIslandWindow_WASDK"
-        || className = "RaycastUIAccessHelper"
-        || className = "RaycastNodeGracefulShutdownClass"
-        return true
-    try processName := WinGetProcessName("ahk_id " hwnd)
-    catch
-        processName := ""
-    try title := WinGetTitle("ahk_id " hwnd)
-    catch
-        title := ""
-    return (StrLower(processName) = "msedgewebview2.exe" && title = "Widgets")
-        || StrLower(processName) = "raycast.exe"
 }
 
 ApplyRestoredWorkspaceVisibility() {
@@ -3717,14 +3769,19 @@ InitializeDebugLogging() {
         SplitPath(DEBUG_LOG_PATH,, &logDirectory)
         DirCreate(logDirectory)
         RotateDebugLogIfNeeded()
-        FileAppend("`n===== SESSION " DEBUG_SESSION_ID " =====`n", DEBUG_LOG_PATH, "UTF-8")
+        WriteDebugLogText("`n===== SESSION " DEBUG_SESSION_ID " =====`n")
     }
 }
 
 RotateDebugLogIfNeeded() {
-    global DEBUG_LOG_PATH, DEBUG_PREVIOUS_LOG_PATH, DEBUG_MAX_BYTES
+    global DEBUG_LOG_PATH, DEBUG_PREVIOUS_LOG_PATH, DEBUG_MAX_BYTES, DebugLogFile
     if !FileExist(DEBUG_LOG_PATH) || FileGetSize(DEBUG_LOG_PATH) < DEBUG_MAX_BYTES
         return false
+    ; An open handle would keep writing into the renamed file.
+    if DebugLogFile {
+        DebugLogFile.Close()
+        DebugLogFile := false
+    }
     if FileExist(DEBUG_PREVIOUS_LOG_PATH)
         FileDelete(DEBUG_PREVIOUS_LOG_PATH)
     FileMove(DEBUG_LOG_PATH, DEBUG_PREVIOUS_LOG_PATH, true)
@@ -3741,15 +3798,26 @@ DebugLog(event, details := "") {
         line := timestamp " [" DEBUG_SESSION_ID "] [" event "]"
         if details != ""
             line .= " " DebugClean(details)
-        FileAppend(line "`n", DEBUG_LOG_PATH, "UTF-8")
+        WriteDebugLogText(line "`n")
         linesSinceSizeCheck += 1
         if linesSinceSizeCheck >= 500 {
             linesSinceSizeCheck := 0
             if RotateDebugLogIfNeeded()
-                FileAppend("===== SESSION " DEBUG_SESSION_ID " (continued) =====`n",
-                    DEBUG_LOG_PATH, "UTF-8")
+                WriteDebugLogText("===== SESSION " DEBUG_SESSION_ID " (continued) =====`n")
         }
     }
+}
+
+WriteDebugLogText(text) {
+    global DEBUG_LOG_PATH, DebugLogFile
+    ; Opening and closing the log for every line took about 8 ms each, which
+    ; added up to most of a workspace switch. Keep it open and flush each
+    ; line so a hang or crash still leaves it on disk.
+    if !DebugLogFile
+        DebugLogFile := FileOpen(DEBUG_LOG_PATH, "a", "UTF-8")
+    DebugLogFile.Seek(0, 2) ; another engine instance may have appended
+    DebugLogFile.Write(text)
+    DebugLogFile.Read(0) ; flush the write buffer
 }
 
 DebugClean(value) {

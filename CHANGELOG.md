@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.21 - 2026-10-25
+
+- Stop adopting on-screen displays, tray flyouts, notifications, tooltips, menus, and meeting or screen-sharing overlays as workspace windows, so a Caps Lock indicator no longer gets stuck on screen after a workspace visit
+- Keep focusing a Zoom share toolbar, annotation bar, or similar overlay, or opening the tray overflow, from switching the monitor to another workspace
+- Release such windows saved by earlier versions on startup without popping them back up
+- Limit restart memory to apps' top-level windows, so a newly opened dialog or popup is no longer hidden as the "restart" of one closed on another workspace
+- Keep the debug log open instead of reopening it for every line, which took about 8 ms each and made up most of a workspace switch's delay
+- Check visibility first in the 250 ms window scan
+- Add transient-window regression tests
+
 ## 1.2.20 - 2026-10-23
 
 - Prevent an app that stops responding from freezing the whole workspace engine, including its watchdog and hotkeys

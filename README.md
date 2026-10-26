@@ -67,6 +67,8 @@ To carry a window to another workspace, hold its title bar and start dragging, t
 
 Workspace changes use a 340 ms directional slide with no crossfade. Moving to a higher D-number slides the current workspace left and brings the next one in from the right; moving to a lower D-number reverses that motion. Two opaque, monitor-sized workspace frames are composed at the monitor's physical resolution in a persistent off-screen buffer and presented as one Desktop Window Manager-synchronized surface. The surface is created in per-monitor-v2 DPI mode and sized while hidden with physical-pixel coordinates, so no scaled or zoomed frame appears before the slide. Its edges remain pixel-locked, preventing wallpaper gaps, erase flicker, or DPI rescaling while real application positions and maximized state remain unchanged.
 
+Workspaces hold app windows: the ones Windows shows on the taskbar and in Alt+Tab, their dialogs, and the palettes and frame shadows they own. On-screen displays such as a Caps Lock indicator, tray flyouts, notifications, tooltips, menus, and meeting or screen-sharing overlays such as Zoom's share toolbar and border are left to the apps that show them. They stay where their app puts them, and focusing one never switches a monitor's workspace.
+
 The completed animation frame stays in place until every incoming app is visible. Each workspace also remembers its full top-to-bottom window stack, so returning to a workspace restores all of its apps with the same overlapping or maximized app on top instead of whichever app responds first.
 
 You can press the switching shortcuts repeatedly without waiting for an animation to finish. Additional input completes the active visual frame immediately, coalesces to the latest requested D-number, and uses a shorter 190 ms slide for the queued destination.
@@ -77,7 +79,7 @@ Clicking an app on the Windows taskbar also follows its workspace assignment. Th
 
 When an app closes and reopens within ten minutes on the same monitor, the utility remembers its workspace. For example, an app updating on D3 returns to D3 while you continue working on D2. Matching uses the executable's installation path and window class, allowing common `app-<version>` and WindowsApps version-folder changes. It checks for replacement windows every 250 ms and suppresses their startup focus requests for two seconds; an explicit taskbar click still follows the app to its workspace. A brief appearance before detection is possible.
 
-Restart memory lasts for the current workspace-engine session and also applies to a manual close and reopen. Each closed window allows one replacement. Apps whose matching windows belong to different workspaces, reopen on another monitor, or change their executable path or window class beyond the supported version-folder patterns use normal placement. Resetting workspaces clears restart memory.
+Restart memory lasts for the current workspace-engine session and also applies to a manual close and reopen. It covers an app's top-level windows; its dialogs and popups always open on the workspace you are using. Each closed window allows one replacement. Apps whose matching windows belong to different workspaces, reopen on another monitor, or change their executable path or window class beyond the supported version-folder patterns use normal placement. Resetting workspaces clears restart memory.
 
 ## Workspace overview
 
