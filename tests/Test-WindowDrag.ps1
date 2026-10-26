@@ -134,7 +134,7 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
     TestAnimations += 1
     return false
 }
-RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd := 0) {
+RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd := 0, coverHwnd := 0) {
     global TestRestored
     TestRestored := GetWorkspaceWindowOrder(monitor, workspace)
 }

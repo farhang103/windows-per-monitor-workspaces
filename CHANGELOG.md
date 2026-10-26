@@ -2,11 +2,17 @@
 
 ## 1.2.22 - 2026-10-26
 
-- Slide a workspace in over the real wallpaper and desktop icons when no recent capture of it exists. A window closing, moving, or restarting there, or an engine restart, discards that capture, and the rebuilt frame used to show a near-black screen until the windows appeared
-- Capture each monitor's desktop at startup, after wallpaper or work-area changes, and every five minutes while the user pauses
-- Stop snapshotting hidden windows, which print as solid black, so a maximized app on another workspace no longer slides in as a black screen after an engine restart
-- Draw only each window's visible frame, so floating windows have no black resize border in the slide
-- Add desktop-background regression tests
+- Slide a workspace in exactly as it will look when no recent capture of it exists. A window closing, moving, or restarting there, or an engine restart, discards that capture, and the frame rebuilt from window snapshots used to show a near-black screen until the windows appeared
+- Reveal such a workspace's windows under the outgoing frame and capture them from the screen before the slide, with wallpaper, desktop icons, shadows, rounded corners, and windows hidden since before the engine started. The cover is excluded from that capture, and the capture waits for slow apps to finish hiding outgoing windows
+- While carrying a window, capture both desktops from the screen too, and repaint only the area around the held window and its shadow from snapshots, so neither desktop holds a second copy of it. Desktops used to be built entirely from snapshots during a drag
+- Fade the cover out over 120 ms after a slide that used a remembered or patched frame, so content an app drew while hidden crossfades in instead of jumping. A frame captured moments before the slide skips the fade, as does a queued switch
+- Keep windows revealed before a slide beneath its cover, including always-on-top ones. An always-on-top window on a drag's destination waits for the slide to finish, because a drag's cover cannot sit above it
+- Keep clicks during a slide from reaching the windows under the cover; they pass through once the cover starts fading
+- Draw the real wallpaper and desktop icons behind frames that are still built from snapshots. Each monitor's desktop is captured at startup, after wallpaper or work-area changes, and every five minutes while the user pauses
+- Stop snapshotting hidden windows, which print as solid black, so a maximized app on another workspace no longer slides in as a black screen
+- Draw only each window's visible frame in snapshot-built frames, so floating windows have no black resize border
+- Show the overview's preview placeholder for a window hidden since before the engine started, instead of an empty preview
+- Add desktop-background, uncached-switch, fade, cover-order, and overview-placeholder regression tests, and run the drag animation test through the reveal and capture
 
 ## 1.2.21 - 2026-10-25
 

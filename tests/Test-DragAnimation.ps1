@@ -69,19 +69,25 @@ TestNativeDragAnimation() {
             newColor := direction = 1 ? 0x44CC22 : 0xCC4422
             AssertNative(FramePixel(state.outgoingFrame, 180, 180) = oldColor,
                 "outgoing frame contains underlying app, without held-window ghost")
+            ; Same order as a switch: hide the outgoing app, reveal the
+            ; incoming one under the cover, then capture it.
+            leaving := direction = 1 ? outgoing : incoming
+            leaving.Hide()
+            HiddenByScript[leaving.Hwnd] := true
+            AssertNative(state.incomingPending, "uncached incoming workspace waits for its reveal")
+            RevealWorkspaceForHandoff(monitor, destination, 260, held.Hwnd, state.hwnd)
+            AssertNative(DllCall("GetWindow", "ptr", state.hwnd, "uint", 3, "ptr") = held.Hwnd,
+                "revealed windows stay beneath the cover")
+            CompleteIncomingWorkspaceFrame(state, [leaving.Hwnd])
             actualColor := FramePixel(state.incomingFrame, 180, 180)
             AssertNative(actualColor = newColor,
                 "incoming frame omits held-window ghost: actual=" actualColor " expected=" newColor)
+            AssertNative(!state.incomingExact, "a patched frame fades out at the end")
             AssertNative(state.incomingOffset = direction * state.width, "correct initial side")
             RunWorkspaceSlideAnimation(state)
             AssertNative(state.outgoingOffset = -direction * state.width && state.incomingOffset = 0,
                 "slide reaches correct destination")
             AssertNative(IsVisible(held.Hwnd), "held window survives complete animation")
-            if direction = 1 {
-                outgoing.Hide()
-                HiddenByScript[outgoing.Hwnd] := true
-            }
-            RevealWorkspaceForHandoff(monitor, destination, 260, held.Hwnd)
             EndWorkspaceSlideAnimation(state)
             state := false
         }

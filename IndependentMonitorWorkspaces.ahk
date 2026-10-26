@@ -11,6 +11,7 @@ WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
 RAPID_WORKSPACE_SLIDE_MS := 190
+WORKSPACE_FADE_MS := 120
 INDICATOR_MS := 850
 WORKSPACE_WATCHDOG_SOFT_MS := 1400
 WORKSPACE_WATCHDOG_RESTART_MS := 4500
@@ -335,6 +336,7 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
 
         ; First hide every non-target window. Incoming windows remain hidden
         ; until their captured surfaces finish sliding into place.
+        hiddenWindows := []
         for hwnd, slot in WindowWorkspace.Clone() {
             if !WinExist("ahk_id " hwnd) {
                 ForgetWindow(hwnd)
@@ -353,6 +355,7 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
                     CaptureWindowSnapshot(hwnd)
                 HideWindowFast(hwnd)
                 HiddenByScript[hwnd] := true
+                hiddenWindows.Push(hwnd)
             } else {
                 DebugLog("SWITCH_SKIP", "target=D" workspace " assigned=D" slot.workspace
                     " visible=" IsVisible(hwnd) " manageable=" IsManageableWindow(hwnd)
@@ -361,15 +364,30 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
         }
 
         MarkWorkspaceSwitchProgress("windows-hidden")
+
+        ; Keep an opaque animation frame in place until every app that this
+        ; script hid has acknowledged its show request. A fixed delay races
+        ; slower application UI threads and exposes only the first app to
+        ; respond. Restore the saved window stack while it is still covered.
+        ; An uncached workspace is revealed under the outgoing frame before the
+        ; slide, so it slides in exactly as it will look, shadows included,
+        ; even for windows hidden since before the engine started.
+        revealed := false
+        if animation && animation.incomingPending {
+            RevealWorkspaceForHandoff(monitor, workspace, 260, draggedHwnd, animation.hwnd)
+            revealed := true
+            MarkWorkspaceSwitchProgress("incoming-revealed")
+            CompleteIncomingWorkspaceFrame(animation, hiddenWindows)
+            MarkWorkspaceSwitchProgress("incoming-captured")
+        }
         RunWorkspaceSlideAnimation(animation)
         MarkWorkspaceSwitchProgress("animation-complete")
-
-        ; Keep the completed, opaque animation frame in place until every app
-        ; that this script hid has acknowledged its show request. A fixed delay
-        ; races slower application UI threads and exposes only the first app to
-        ; respond. Restore the saved window stack while it is still covered.
-        RevealWorkspaceForHandoff(monitor, workspace, 260, draggedHwnd)
+        ; A drag holds topmost windows back from an early reveal; show them
+        ; while the cover is still up.
+        if !revealed || draggedHwnd && HasScriptHiddenWorkspaceWindows(monitor, workspace)
+            RevealWorkspaceForHandoff(monitor, workspace, 260, draggedHwnd)
         MarkWorkspaceSwitchProgress("handoff-complete")
+        FadeOutWorkspaceSlide(animation)
         EndWorkspaceSlideAnimation(animation)
         animation := false
 
@@ -812,11 +830,13 @@ RegisterOverviewThumbnail(state, pending) {
         return true
     }
 
+    ; A live thumbnail of a hidden window is empty. One hidden since before the
+    ; engine started has no snapshot until its workspace is next shown.
     thumbnail := 0
-    try result := DllCall("dwmapi\DwmRegisterThumbnail",
-        "ptr", state.hwnd, "ptr", pending.hwnd, "ptr*", &thumbnail, "int")
-    catch
-        result := -1
+    result := -1
+    if !HiddenByScript.Has(pending.hwnd)
+        try result := DllCall("dwmapi\DwmRegisterThumbnail",
+            "ptr", state.hwnd, "ptr", pending.hwnd, "ptr*", &thumbnail, "int")
 
     if result != 0 || !thumbnail {
         AddOverviewText(state,
@@ -2418,7 +2438,7 @@ GetWorkspaceWindowOrder(monitor, workspace) {
     return order
 }
 
-RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd := 0) {
+RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd := 0, coverHwnd := 0) {
     order := GetWorkspaceWindowOrder(monitor, workspace)
     restored := 0
 
@@ -2430,10 +2450,22 @@ RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd := 0) {
             continue
         if !WinExist("ahk_id " hwnd) || !IsVisible(hwnd)
             continue
+        insertAfter := draggedHwnd
+        ; Revealed before the slide, a window must stay beneath its cover. In a
+        ; drag the cover sits just below the held window; otherwise the cover
+        ; is topmost, and only a topmost window could rise above it. Placing a
+        ; topmost window under a normal one would strip its topmost state.
+        if coverHwnd {
+            try topmost := (WinGetExStyle("ahk_id " hwnd) & 0x8) != 0
+            catch
+                topmost := false
+            if draggedHwnd ? !topmost : topmost
+                insertAfter := coverHwnd
+        }
         ; Post the reorder during a drag or to a hung app instead of waiting.
         postReorder := draggedHwnd || !IsWindowResponsive(hwnd)
         try {
-            result := DllCall("SetWindowPos", "ptr", hwnd, "ptr", draggedHwnd,
+            result := DllCall("SetWindowPos", "ptr", hwnd, "ptr", insertAfter,
                 "int", 0, "int", 0, "int", 0, "int", 0,
                 "uint", postReorder ? 0x4013 : 0x0013, "int") ; NOMOVE|NOSIZE|NOACTIVATE; optional ASYNCWINDOWPOS
             restored += result ? 1 : 0
@@ -2445,7 +2477,17 @@ RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd := 0) {
     return restored
 }
 
-RevealWorkspaceForHandoff(monitor, workspace, timeoutMs := 260, draggedHwnd := 0) {
+HasScriptHiddenWorkspaceWindows(monitor, workspace) {
+    global WindowWorkspace, HiddenByScript
+    for hwnd, slot in WindowWorkspace {
+        if slot.monitor = monitor && slot.workspace = workspace && HiddenByScript.Has(hwnd)
+            return true
+    }
+    return false
+}
+
+RevealWorkspaceForHandoff(monitor, workspace, timeoutMs := 260, draggedHwnd := 0,
+    coverHwnd := 0) {
     global WindowWorkspace, HiddenByScript
     expected := []
     showStartedAt := A_TickCount
@@ -2456,6 +2498,18 @@ RevealWorkspaceForHandoff(monitor, workspace, timeoutMs := 260, draggedHwnd := 0
         if !WinExist("ahk_id " hwnd) {
             ForgetWindow(hwnd)
             continue
+        }
+        ; A drag's cover is not topmost, so a topmost window revealed before
+        ; the slide would show above it. It waits for the slide to finish.
+        if coverHwnd && draggedHwnd && HiddenByScript.Has(hwnd) {
+            try topmost := (WinGetExStyle("ahk_id " hwnd) & 0x8) != 0
+            catch
+                topmost := false
+            if topmost {
+                DebugLog("SWITCH_DEFER", "target=D" workspace " reason=topmost-during-drag "
+                    DebugDescribeWindow(hwnd))
+                continue
+            }
         }
         if HiddenByScript.Has(hwnd) {
             expected.Push(hwnd)
@@ -2496,7 +2550,7 @@ RevealWorkspaceForHandoff(monitor, workspace, timeoutMs := 260, draggedHwnd := 0
         Sleep(8)
     }
 
-    RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd)
+    RestoreWorkspaceWindowOrder(monitor, workspace, draggedHwnd, coverHwnd)
     ; IsWindowVisible changes before every compositor surface is necessarily on
     ; screen. Two DWM presentation boundaries make the cover removal atomic to
     ; the user's eye while adding only one or two refresh intervals.
@@ -2991,18 +3045,26 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
     height := bottom - top
     RefreshWorkspaceWindowSnapshots(monitor, oldWorkspace, draggedHwnd)
     outgoingCaptureStarted := A_TickCount
-    ; A screen capture would bake the held window into the outgoing desktop,
-    ; making a second copy slide away. Compose both desktops without it instead.
-    outgoingFrame := draggedHwnd
-        ? BuildWorkspaceFrameFromSnapshots(monitor, oldWorkspace, draggedHwnd)
-        : CaptureMonitorWorkspaceFrame(monitor, oldWorkspace)
+    outgoingFrame := CaptureMonitorWorkspaceFrame(monitor, oldWorkspace)
+    ; The capture holds the live held window, which would slide away as a
+    ; second copy. Paint over it with what lies beneath.
+    if outgoingFrame && draggedHwnd
+        PatchCarriedWindow(outgoingFrame, monitor, oldWorkspace, draggedHwnd)
     outgoingCaptureMs := A_TickCount - outgoingCaptureStarted
     if !outgoingFrame
         outgoingFrame := BuildWorkspaceFrameFromSnapshots(monitor, oldWorkspace, draggedHwnd)
     incomingWasCached := !draggedHwnd && GetWorkspaceFrame(monitor, newWorkspace) != false
     incomingStarted := A_TickCount
     incomingFrame := draggedHwnd ? false : GetWorkspaceFrame(monitor, newWorkspace)
-    if !incomingFrame
+    ; Without a cached frame, the incoming workspace is captured from its real
+    ; windows once they are revealed behind the cover. Older Windows builds
+    ; black out a window excluded from capture instead of omitting it. The
+    ; outgoing frame stands in until then: at the starting offset the incoming
+    ; half is entirely off screen.
+    incomingPending := !incomingFrame && VerCompare(A_OSVersion, "10.0.19041") >= 0
+    if incomingPending
+        incomingFrame := outgoingFrame
+    else if !incomingFrame
         incomingFrame := BuildWorkspaceFrameFromSnapshots(monitor, newWorkspace, draggedHwnd)
     incomingPreparationMs := A_TickCount - incomingStarted
     if !outgoingFrame || !incomingFrame {
@@ -3012,6 +3074,12 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
     }
 
     layer := CreatePhysicalPixelLayer()
+    ; Layered so it can fade out over the revealed windows, and not
+    ; click-through while it covers the switch: a click on an outgoing window
+    ; would switch straight back.
+    layer.Opt("-E0x20 +E0x80000")
+    DllCall("SetLayeredWindowAttributes", "ptr", layer.Hwnd, "uint", 0, "uchar", 255,
+        "uint", 2)
     ; Keep the real app in its existing Z-order and native mouse-capture loop.
     ; Only our own layer moves behind it; the app never becomes topmost.
     if draggedHwnd
@@ -3023,6 +3091,7 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
         oldWorkspace: oldWorkspace, newWorkspace: newWorkspace,
         direction: direction, duration: duration, draggedHwnd: draggedHwnd,
         outgoingFrame: outgoingFrame, incomingFrame: incomingFrame,
+        incomingPending: incomingPending, incomingExact: false,
         outgoingOffset: 0, incomingOffset: direction * width,
         bufferDc: 0, bufferBitmap: 0, oldBufferBitmap: 0, sourceDc: 0
     }
@@ -3054,12 +3123,61 @@ BeginWorkspaceSlideAnimation(monitor, oldWorkspace, newWorkspace, direction, dur
         " geometry=" DebugWindowRenderGeometry(state.hwnd)
         " outgoingCaptureMs=" outgoingCaptureMs
         " incomingCached=" incomingWasCached
+        " incomingPending=" incomingPending
         " incomingPreparationMs=" incomingPreparationMs
         " totalPreparationMs=" (A_TickCount - preparationStarted))
     return state
 }
 
-RefreshWorkspaceWindowSnapshots(monitor, workspace, excludedHwnd := 0) {
+CompleteIncomingWorkspaceFrame(state, outgoingWindows) {
+    started := A_TickCount
+    ; A slow app can still be showing an outgoing window. Hiding is
+    ; asynchronous, and the capture must not bake it into the new workspace.
+    stillVisible := WaitForWindowsHidden(outgoingWindows, 260)
+    ; Only this switch's cover may stand between the screen and the capture.
+    CancelTaskbarActivationShield(state.monitor, 0, "incoming-capture")
+    frame := false
+    ; The cover stays on screen; screen captures alone look through it.
+    if DllCall("SetWindowDisplayAffinity", "ptr", state.hwnd, "uint", 0x11, "int") {
+        frame := CaptureMonitorWorkspaceFrame(state.monitor, state.newWorkspace)
+        DllCall("SetWindowDisplayAffinity", "ptr", state.hwnd, "uint", 0, "int")
+    }
+    source := "screen"
+    if frame && state.draggedHwnd {
+        PatchCarriedWindow(frame, state.monitor, state.newWorkspace, state.draggedHwnd, true)
+        source := "screen-patched"
+    }
+    if !frame {
+        frame := BuildWorkspaceFrameFromSnapshots(state.monitor, state.newWorkspace,
+            state.draggedHwnd)
+        source := "snapshots"
+    }
+    if frame
+        state.incomingFrame := frame
+    state.incomingPending := false
+    ; Only an untouched capture matches the revealed windows exactly.
+    state.incomingExact := frame && source = "screen"
+    DebugLog("SLIDE_INCOMING_CAPTURE", "monitor=" state.monitor
+        " workspace=D" state.newWorkspace " source=" (frame ? source : "failed")
+        " outgoingStillVisible=" stillVisible " elapsedMs=" (A_TickCount - started))
+    return frame != false
+}
+
+WaitForWindowsHidden(windows, timeoutMs) {
+    started := A_TickCount
+    loop {
+        visible := 0
+        for hwnd in windows {
+            if WinExist("ahk_id " hwnd) && IsVisible(hwnd)
+                visible += 1
+        }
+        if !visible || A_TickCount - started >= timeoutMs
+            return visible
+        Sleep(8)
+    }
+}
+
+RefreshWorkspaceWindowSnapshots(monitor, workspace, excludedHwnd := 0, within := false) {
     windows := GetOverviewWindows(monitor, workspace)
     for hwnd in windows {
         if hwnd = excludedHwnd
@@ -3068,6 +3186,13 @@ RefreshWorkspaceWindowSnapshots(monitor, workspace, excludedHwnd := 0) {
         ; has nothing to capture.
         if !WinExist("ahk_id " hwnd) || !IsVisible(hwnd)
             continue
+        if within {
+            rect := Buffer(16, 0)
+            if !DllCall("GetWindowRect", "ptr", hwnd, "ptr", rect.Ptr)
+                || NumGet(rect, 0, "int") >= within.right || NumGet(rect, 8, "int") <= within.left
+                || NumGet(rect, 4, "int") >= within.bottom || NumGet(rect, 12, "int") <= within.top
+                continue
+        }
         try minimized := WinGetMinMax("ahk_id " hwnd) = -1
         catch
             minimized := false
@@ -3110,7 +3235,6 @@ CaptureMonitorWorkspaceFrame(monitor, workspace) {
 }
 
 BuildWorkspaceFrameFromSnapshots(monitor, workspace, excludedHwnd := 0) {
-    global WindowSnapshots, OverviewPreviewMode
     MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
     width := right - left
     height := bottom - top
@@ -3129,6 +3253,69 @@ BuildWorkspaceFrameFromSnapshots(monitor, workspace, excludedHwnd := 0) {
     }
 
     oldBitmap := DllCall("SelectObject", "ptr", memoryDc, "ptr", bitmap, "ptr")
+    drawn := DrawWorkspaceFromSnapshots(memoryDc, screenDc, monitor, workspace, excludedHwnd)
+    DllCall("SelectObject", "ptr", memoryDc, "ptr", oldBitmap)
+    DllCall("DeleteDC", "ptr", memoryDc)
+    DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
+    DebugLog("SLIDE_FRAME_BUILD", "monitor=" monitor " workspace=D" workspace
+        " windows=" drawn.windows " background=" drawn.background)
+    return StoreWorkspaceFrame(monitor, workspace,
+        {bitmap: bitmap, width: width, height: height})
+}
+
+PatchCarriedWindow(frame, monitor, workspace, carriedHwnd, refreshSnapshots := false) {
+    ; The held window stays live above the slide, so a screen capture holds a
+    ; second copy of it and its shadow. Repaint that area from the desktop and
+    ; window snapshots to show what lies beneath it instead.
+    MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
+    bounds := Buffer(16, 0)
+    if DllCall("dwmapi\DwmGetWindowAttribute", "ptr", carriedHwnd, "uint", 9,
+        "ptr", bounds.Ptr, "uint", 16, "int") != 0
+        && !DllCall("GetWindowRect", "ptr", carriedHwnd, "ptr", bounds.Ptr)
+        return false
+    ; An inactive window's shadow reaches about 23, 6 and 54 px past its
+    ; sides, top and bottom at 100% scaling, and the held window is active,
+    ; whose shadow is larger.
+    scale := GetMonitorDpi(monitor) / 96
+    patchLeft := Max(left, NumGet(bounds, 0, "int") - Round(48 * scale))
+    patchTop := Max(top, NumGet(bounds, 4, "int") - Round(24 * scale))
+    patchRight := Min(right, NumGet(bounds, 8, "int") + Round(48 * scale))
+    patchBottom := Min(bottom, NumGet(bounds, 12, "int") + Round(96 * scale))
+    if patchRight <= patchLeft || patchBottom <= patchTop
+        return false
+    ; Revealed incoming windows can be captured afresh. Only the ones under
+    ; the patch matter.
+    if refreshSnapshots
+        RefreshWorkspaceWindowSnapshots(monitor, workspace, carriedHwnd,
+            {left: patchLeft, top: patchTop, right: patchRight, bottom: patchBottom})
+
+    screenDc := DllCall("GetDC", "ptr", 0, "ptr")
+    memoryDc := screenDc ? DllCall("CreateCompatibleDC", "ptr", screenDc, "ptr") : 0
+    if !memoryDc {
+        if screenDc
+            DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
+        return false
+    }
+    oldBitmap := DllCall("SelectObject", "ptr", memoryDc, "ptr", frame.bitmap, "ptr")
+    DllCall("IntersectClipRect", "ptr", memoryDc,
+        "int", patchLeft - left, "int", patchTop - top,
+        "int", patchRight - left, "int", patchBottom - top)
+    drawn := DrawWorkspaceFromSnapshots(memoryDc, screenDc, monitor, workspace, carriedHwnd)
+    DllCall("SelectObject", "ptr", memoryDc, "ptr", oldBitmap)
+    DllCall("DeleteDC", "ptr", memoryDc)
+    DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
+    DebugLog("SLIDE_FRAME_PATCH", "monitor=" monitor " workspace=D" workspace
+        " carriedHwnd=" carriedHwnd " rect=" (patchLeft - left) "," (patchTop - top)
+        "," (patchRight - left) "," (patchBottom - top)
+        " windows=" drawn.windows " background=" drawn.background)
+    return true
+}
+
+DrawWorkspaceFromSnapshots(memoryDc, screenDc, monitor, workspace, excludedHwnd := 0) {
+    global WindowSnapshots, OverviewPreviewMode
+    MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
+    width := right - left
+    height := bottom - top
     ; Start from the real desktop, which is what shows around the windows once
     ; the workspace is revealed. A flat fill there reads as a dark flash.
     background := GetDesktopBackground(monitor, left, top, width, height)
@@ -3207,14 +3394,7 @@ BuildWorkspaceFrameFromSnapshots(monitor, workspace, excludedHwnd := 0) {
         })
         drawn += 1
     }
-
-    DllCall("SelectObject", "ptr", memoryDc, "ptr", oldBitmap)
-    DllCall("DeleteDC", "ptr", memoryDc)
-    DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
-    DebugLog("SLIDE_FRAME_BUILD", "monitor=" monitor " workspace=D" workspace
-        " windows=" drawn " background=" (backgroundDrawn ? "desktop" : "fill"))
-    return StoreWorkspaceFrame(monitor, workspace,
-        {bitmap: bitmap, width: width, height: height})
+    return {windows: drawn, background: backgroundDrawn ? "desktop" : "fill"}
 }
 
 GetWorkspaceFrame(monitor, workspace) {
@@ -3573,6 +3753,36 @@ RunWorkspaceSlideAnimation(state) {
         " frames=" frameCount " averageIntervalMs=" averageInterval
         " maxIntervalMs=" maxInterval " maxRenderMs=" maxRenderMs
         " slowFramesOver20Ms=" slowFrames " accelerated=" accelerated)
+}
+
+FadeOutWorkspaceSlide(state) {
+    global WORKSPACE_FADE_MS, PendingWorkspaceSwitches, WorkspaceSlideSkipRequests
+    ; The real windows are in place under the cover now. A cached frame can
+    ; be older than what an app drew while hidden, and a patched one only
+    ; approximates what lay under a held window, so fade the cover out
+    ; instead of cutting to the windows. A capture taken moments ago already
+    ; matches them, and a queued switch should not wait.
+    if !state || state.incomingExact || PendingWorkspaceSwitches.Count
+        || WorkspaceSlideSkipRequests.Has(state.monitor)
+        return
+    ; Let input reach the revealed windows while the cover fades.
+    try WinSetExStyle("+0x20", "ahk_id " state.hwnd)
+    started := A_TickCount
+    frames := 0
+    loop {
+        progress := Min(1, (A_TickCount - started) / WORKSPACE_FADE_MS)
+        eased := progress < 0.5 ? 2 * progress * progress : 1 - ((-2 * progress + 2) ** 2) / 2
+        DllCall("SetLayeredWindowAttributes", "ptr", state.hwnd, "uint", 0,
+            "uchar", Round(255 * (1 - eased)), "uint", 2)
+        try DllCall("dwmapi\DwmFlush")
+        frames += 1
+        if progress >= 1 || PendingWorkspaceSwitches.Count
+            || WorkspaceSlideSkipRequests.Has(state.monitor)
+            break
+        Sleep(1)
+    }
+    DebugLog("SLIDE_FADE", "monitor=" state.monitor " to=D" state.newWorkspace
+        " frames=" frames " elapsedMs=" (A_TickCount - started))
 }
 
 EndWorkspaceSlideAnimation(state) {
