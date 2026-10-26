@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.22 - 2026-10-26
+
+- Slide a workspace in over the real wallpaper and desktop icons when no recent capture of it exists. A window closing, moving, or restarting there, or an engine restart, discards that capture, and the rebuilt frame used to show a near-black screen until the windows appeared
+- Capture each monitor's desktop at startup, after wallpaper or work-area changes, and every five minutes while the user pauses
+- Stop snapshotting hidden windows, which print as solid black, so a maximized app on another workspace no longer slides in as a black screen after an engine restart
+- Draw only each window's visible frame, so floating windows have no black resize border in the slide
+- Add desktop-background regression tests
+
 ## 1.2.21 - 2026-10-25
 
 - Stop adopting on-screen displays, tray flyouts, notifications, tooltips, menus, and meeting or screen-sharing overlays as workspace windows, so a Caps Lock indicator no longer gets stuck on screen after a workspace visit

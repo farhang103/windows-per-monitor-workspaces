@@ -6,7 +6,7 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.21"
+APP_VERSION := "1.2.22"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
@@ -27,6 +27,10 @@ global WindowSnapshots := Map()
 global WorkspaceFrames := Map()
 global WorkspaceWindowOrders := Map()
 global DeferredWorkspaceFrameDeletes := []
+global DesktopBackgrounds := Map()
+global DesktopBackgroundsCapturedAt := 0
+global DesktopBackgroundsAttemptedAt := 0
+DESKTOP_BACKGROUND_REFRESH_MS := 5 * 60 * 1000
 global WorkspaceSlideAnimations := Map()
 global WorkspaceOverlays := Map()
 global WorkspaceOverview := false
@@ -152,6 +156,7 @@ if A_Args.Length && A_Args[1] = "--watchdog-preview" {
 InitializeMonitors()
 OnExit(HandleAppExit)
 OnMessage(0x007E, HandleDisplayChange) ; WM_DISPLAYCHANGE
+OnMessage(0x001A, HandleSettingChange) ; WM_SETTINGCHANGE
 LoadWorkspaceState()
 SyncRequestedWorkspaces()
 LearnVisibleWindows()
@@ -177,6 +182,8 @@ InstallForegroundWinEventHook()
 SetTimer(CheckExternalWorkspaceActivation, 15)
 SetTimer(CheckRestartedWorkspaceWindows, 250)
 SetTimer(CheckWorkspaceEngineHealth, 250)
+SetTimer(RefreshDesktopBackgrounds, -1500)
+SetTimer(RefreshDesktopBackgroundsWhenIdle, 30000)
 
 A_TrayMenu.Delete()
 A_TrayMenu.Add("Workspace overview", ToggleWorkspaceOverview)
@@ -917,7 +924,9 @@ HandleWorkspaceSlideEraseBackground(wParam, lParam, msg, hwnd) {
     }
 }
 
-DrawOverviewSnapshot(destinationDc, snapshot, rect) {
+DrawOverviewSnapshot(destinationDc, snapshot, rect, source := false) {
+    if !source
+        source := {x: 0, y: 0, w: snapshot.width, h: snapshot.height}
     sourceDc := DllCall("CreateCompatibleDC", "ptr", destinationDc, "ptr")
     if !sourceDc
         return
@@ -925,7 +934,7 @@ DrawOverviewSnapshot(destinationDc, snapshot, rect) {
     DllCall("SetStretchBltMode", "ptr", destinationDc, "int", 4)
     DllCall("StretchBlt",
         "ptr", destinationDc, "int", rect.x, "int", rect.y, "int", rect.w, "int", rect.h,
-        "ptr", sourceDc, "int", 0, "int", 0, "int", snapshot.width, "int", snapshot.height,
+        "ptr", sourceDc, "int", source.x, "int", source.y, "int", source.w, "int", source.h,
         "uint", 0x00CC0020)
     DllCall("SelectObject", "ptr", sourceDc, "ptr", oldBitmap)
     DllCall("DeleteDC", "ptr", sourceDc)
@@ -2538,6 +2547,10 @@ CaptureWindowSnapshot(hwnd, allowScreenCapture := true) {
     global WindowSnapshots
     if !WinExist("ahk_id " hwnd)
         return false
+    ; A hidden window prints as solid black even though PrintWindow reports
+    ; success. Keep its last snapshot, or none, instead of a black one.
+    if !IsVisible(hwnd)
+        return false
 
     windowRect := Buffer(16, 0)
     if !DllCall("GetWindowRect", "ptr", hwnd, "ptr", windowRect.Ptr)
@@ -2889,6 +2902,13 @@ HandleDisplayChange(*) {
     SetTimer(ResetAfterDisplayChange, -750)
 }
 
+HandleSettingChange(wParam, *) {
+    ; SPI_SETDESKWALLPAPER = 0x0014, SPI_SETWORKAREA = 0x002F. Wait for
+    ; Explorer to finish the wallpaper transition before capturing it.
+    if wParam = 0x0014 || wParam = 0x002F
+        SetTimer(RefreshDesktopBackgrounds, -2000)
+}
+
 ResetAfterDisplayChange() {
     global Switching
     if Switching {
@@ -2921,6 +2941,7 @@ HandleAppExit(*) {
     RestoreAllWindows()
     ClearWindowSnapshots()
     ClearWorkspaceFrames()
+    ClearDesktopBackgrounds()
     DebugLog("APP_EXIT", "complete")
 }
 
@@ -2944,6 +2965,7 @@ ResetAndRevealAll(*) {
     WorkspaceWindowOrders.Clear()
     ClearWindowSnapshots()
     ClearWorkspaceFrames()
+    ClearDesktopBackgrounds()
     CurrentWorkspace.Clear()
     RequestedWorkspace.Clear()
     PendingWorkspaceSwitches.Clear()
@@ -3107,11 +3129,29 @@ BuildWorkspaceFrameFromSnapshots(monitor, workspace, excludedHwnd := 0) {
     }
 
     oldBitmap := DllCall("SelectObject", "ptr", memoryDc, "ptr", bitmap, "ptr")
-    backgroundRect := Buffer(16, 0)
-    NumPut("int", 0, "int", 0, "int", width, "int", height, backgroundRect, 0)
-    backgroundBrush := DllCall("CreateSolidBrush", "uint", 0x271811, "ptr")
-    DllCall("FillRect", "ptr", memoryDc, "ptr", backgroundRect.Ptr, "ptr", backgroundBrush)
-    DllCall("DeleteObject", "ptr", backgroundBrush)
+    ; Start from the real desktop, which is what shows around the windows once
+    ; the workspace is revealed. A flat fill there reads as a dark flash.
+    background := GetDesktopBackground(monitor, left, top, width, height)
+    backgroundDrawn := false
+    if background {
+        backgroundDc := DllCall("CreateCompatibleDC", "ptr", screenDc, "ptr")
+        if backgroundDc {
+            oldBackgroundBitmap := DllCall("SelectObject", "ptr", backgroundDc,
+                "ptr", background.bitmap, "ptr")
+            backgroundDrawn := DllCall("BitBlt", "ptr", memoryDc,
+                "int", 0, "int", 0, "int", width, "int", height,
+                "ptr", backgroundDc, "int", 0, "int", 0, "uint", 0x00CC0020, "int") != 0
+            DllCall("SelectObject", "ptr", backgroundDc, "ptr", oldBackgroundBitmap)
+            DllCall("DeleteDC", "ptr", backgroundDc)
+        }
+    }
+    if !backgroundDrawn {
+        backgroundRect := Buffer(16, 0)
+        NumPut("int", 0, "int", 0, "int", width, "int", height, backgroundRect, 0)
+        backgroundBrush := DllCall("CreateSolidBrush", "uint", 0x271811, "ptr")
+        DllCall("FillRect", "ptr", memoryDc, "ptr", backgroundRect.Ptr, "ptr", backgroundBrush)
+        DllCall("DeleteObject", "ptr", backgroundBrush)
+    }
 
     windows := GetOverviewWindows(monitor, workspace)
     drawn := 0
@@ -3141,9 +3181,29 @@ BuildWorkspaceFrameFromSnapshots(monitor, workspace, excludedHwnd := 0) {
         windowHeight := NumGet(rect, 12, "int") - windowTop
         if windowWidth <= 0 || windowHeight <= 0
             continue
-        DrawOverviewSnapshot(memoryDc, WindowSnapshots[hwnd], {
-            x: windowLeft - left, y: windowTop - top,
-            w: windowWidth, h: windowHeight
+        ; The invisible resize borders print as solid black. Draw only the
+        ; visible frame so a floating window has no dark edge on the desktop.
+        cropLeft := 0, cropTop := 0, cropRight := 0, cropBottom := 0
+        frameRect := Buffer(16, 0)
+        if DllCall("dwmapi\DwmGetWindowAttribute", "ptr", hwnd, "uint", 9,
+            "ptr", frameRect.Ptr, "uint", 16, "int") = 0 {
+            cropLeft := Max(0, NumGet(frameRect, 0, "int") - windowLeft)
+            cropTop := Max(0, NumGet(frameRect, 4, "int") - windowTop)
+            cropRight := Max(0, windowLeft + windowWidth - NumGet(frameRect, 8, "int"))
+            cropBottom := Max(0, windowTop + windowHeight - NumGet(frameRect, 12, "int"))
+            if cropLeft + cropRight >= windowWidth || cropTop + cropBottom >= windowHeight
+                cropLeft := 0, cropTop := 0, cropRight := 0, cropBottom := 0
+        }
+        snapshot := WindowSnapshots[hwnd]
+        scaleX := snapshot.width / windowWidth
+        scaleY := snapshot.height / windowHeight
+        DrawOverviewSnapshot(memoryDc, snapshot, {
+            x: windowLeft - left + cropLeft, y: windowTop - top + cropTop,
+            w: windowWidth - cropLeft - cropRight, h: windowHeight - cropTop - cropBottom
+        }, {
+            x: Round(cropLeft * scaleX), y: Round(cropTop * scaleY),
+            w: Max(1, Round((windowWidth - cropLeft - cropRight) * scaleX)),
+            h: Max(1, Round((windowHeight - cropTop - cropBottom) * scaleY))
         })
         drawn += 1
     }
@@ -3152,7 +3212,7 @@ BuildWorkspaceFrameFromSnapshots(monitor, workspace, excludedHwnd := 0) {
     DllCall("DeleteDC", "ptr", memoryDc)
     DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
     DebugLog("SLIDE_FRAME_BUILD", "monitor=" monitor " workspace=D" workspace
-        " windows=" drawn " background=opaque")
+        " windows=" drawn " background=" (backgroundDrawn ? "desktop" : "fill"))
     return StoreWorkspaceFrame(monitor, workspace,
         {bitmap: bitmap, width: width, height: height})
 }
@@ -3212,6 +3272,149 @@ FlushDeferredWorkspaceFrameDeletes() {
             try DllCall("DeleteObject", "ptr", bitmap)
     }
     DeferredWorkspaceFrameDeletes := []
+}
+
+GetDesktopBackground(monitor, left, top, width, height) {
+    global DesktopBackgroundsAttemptedAt
+    background := FindDesktopBackground(monitor, left, top, width, height)
+    ; Capture on demand when none fits the monitor's current work area, but
+    ; do not retry a failing capture on every switch.
+    if !background && (!DesktopBackgroundsAttemptedAt
+        || A_TickCount - DesktopBackgroundsAttemptedAt >= 10000) {
+        CaptureDesktopBackgrounds("missing")
+        background := FindDesktopBackground(monitor, left, top, width, height)
+    }
+    return background
+}
+
+FindDesktopBackground(monitor, left, top, width, height) {
+    global DesktopBackgrounds
+    if !DesktopBackgrounds.Has(monitor)
+        return false
+    background := DesktopBackgrounds[monitor]
+    return background.left = left && background.top = top
+        && background.width = width && background.height = height ? background : false
+}
+
+CaptureDesktopBackgrounds(reason) {
+    global DesktopBackgrounds, DesktopBackgroundsCapturedAt, DesktopBackgroundsAttemptedAt
+    ; A hotkey interrupting this would capture again and free bitmaps in use.
+    previousCritical := Critical("On")
+    try {
+        started := A_TickCount
+        DesktopBackgroundsAttemptedAt := started
+        ; Explorer renders the wallpaper and desktop icons into Progman, and a
+        ; full-content print returns them even while app windows cover it.
+        progman := WinExist("ahk_class Progman")
+        if !progman || !IsWindowResponsive(progman) {
+            DebugLog("DESKTOP_BACKGROUND_SKIP", "reason=" reason " progman=" progman)
+            return false
+        }
+        rect := Buffer(16, 0)
+        if !DllCall("GetWindowRect", "ptr", progman, "ptr", rect.Ptr)
+            return false
+        desktopLeft := NumGet(rect, 0, "int")
+        desktopTop := NumGet(rect, 4, "int")
+        desktopWidth := NumGet(rect, 8, "int") - desktopLeft
+        desktopHeight := NumGet(rect, 12, "int") - desktopTop
+        if desktopWidth <= 0 || desktopHeight <= 0
+            return false
+
+        screenDc := DllCall("GetDC", "ptr", 0, "ptr")
+        desktopDc := screenDc ? DllCall("CreateCompatibleDC", "ptr", screenDc, "ptr") : 0
+        cropDc := screenDc ? DllCall("CreateCompatibleDC", "ptr", screenDc, "ptr") : 0
+        desktopBitmap := screenDc ? DllCall("CreateCompatibleBitmap", "ptr", screenDc,
+            "int", desktopWidth, "int", desktopHeight, "ptr") : 0
+        captured := 0
+        printed := false
+        if desktopDc && cropDc && desktopBitmap {
+            oldDesktopBitmap := DllCall("SelectObject", "ptr", desktopDc,
+                "ptr", desktopBitmap, "ptr")
+            ; Printing into a monitor-sized bitmap with a shifted origin draws
+            ; the wrong region, so print the whole desktop and crop it.
+            printed := DllCall("PrintWindow", "ptr", progman, "ptr", desktopDc,
+                "uint", 2, "int") != 0
+            if printed {
+                Loop MonitorGetCount() {
+                    monitor := A_Index
+                    MonitorGetWorkArea(monitor, &left, &top, &right, &bottom)
+                    width := right - left
+                    height := bottom - top
+                    bitmap := DllCall("CreateCompatibleBitmap", "ptr", screenDc,
+                        "int", width, "int", height, "ptr")
+                    if !bitmap
+                        continue
+                    oldCropBitmap := DllCall("SelectObject", "ptr", cropDc, "ptr", bitmap, "ptr")
+                    copied := DllCall("BitBlt", "ptr", cropDc,
+                        "int", 0, "int", 0, "int", width, "int", height,
+                        "ptr", desktopDc, "int", left - desktopLeft, "int", top - desktopTop,
+                        "uint", 0x00CC0020, "int") != 0
+                    DllCall("SelectObject", "ptr", cropDc, "ptr", oldCropBitmap)
+                    if !copied {
+                        DllCall("DeleteObject", "ptr", bitmap)
+                        continue
+                    }
+                    if DesktopBackgrounds.Has(monitor)
+                        try DllCall("DeleteObject", "ptr", DesktopBackgrounds[monitor].bitmap)
+                    DesktopBackgrounds[monitor] := {bitmap: bitmap,
+                        left: left, top: top, width: width, height: height}
+                    captured += 1
+                }
+            }
+            DllCall("SelectObject", "ptr", desktopDc, "ptr", oldDesktopBitmap)
+        }
+        if desktopBitmap
+            DllCall("DeleteObject", "ptr", desktopBitmap)
+        if cropDc
+            DllCall("DeleteDC", "ptr", cropDc)
+        if desktopDc
+            DllCall("DeleteDC", "ptr", desktopDc)
+        if screenDc
+            DllCall("ReleaseDC", "ptr", 0, "ptr", screenDc)
+        if captured
+            DesktopBackgroundsCapturedAt := A_TickCount
+        DebugLog("DESKTOP_BACKGROUND_CAPTURE", "reason=" reason " printed=" printed
+            " monitors=" captured " desktop=" desktopWidth "x" desktopHeight
+            " elapsedMs=" (A_TickCount - started))
+        return captured > 0
+    } finally {
+        Critical(previousCritical)
+    }
+}
+
+ClearDesktopBackgrounds() {
+    global DesktopBackgrounds, DesktopBackgroundsCapturedAt, DesktopBackgroundsAttemptedAt
+    for monitor, background in DesktopBackgrounds {
+        if background.bitmap
+            try DllCall("DeleteObject", "ptr", background.bitmap)
+    }
+    DesktopBackgrounds.Clear()
+    DesktopBackgroundsCapturedAt := 0
+    DesktopBackgroundsAttemptedAt := 0
+}
+
+RefreshDesktopBackgrounds(*) {
+    global Switching
+    if Switching {
+        SetTimer(RefreshDesktopBackgrounds, -300)
+        return
+    }
+    CaptureDesktopBackgrounds("scheduled")
+}
+
+RefreshDesktopBackgroundsWhenIdle(*) {
+    global DESKTOP_BACKGROUND_REFRESH_MS, DesktopBackgroundsCapturedAt
+    global Switching, WorkspaceOverview, TaskbarActivationShields
+    ; Desktop icons and slideshow wallpapers change without a notification.
+    ; Refresh only while the user pauses, so a capture never delays a switch
+    ; or stutters a fullscreen game.
+    if DesktopBackgroundsCapturedAt
+        && A_TickCount - DesktopBackgroundsCapturedAt < DESKTOP_BACKGROUND_REFRESH_MS
+        return
+    if Switching || WorkspaceOverview || TaskbarActivationShields.Count
+        || A_TimeIdle < 1500 || IsForegroundFullscreen()
+        return
+    CaptureDesktopBackgrounds("idle")
 }
 
 InitializeWorkspaceSlideBackBuffer(state) {
