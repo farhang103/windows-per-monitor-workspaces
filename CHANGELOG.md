@@ -4,6 +4,9 @@
 
 - Stop adopting on-screen displays, tray flyouts, notifications, tooltips, menus, and meeting or screen-sharing overlays as workspace windows, so a Caps Lock indicator no longer gets stuck on screen after a workspace visit
 - Keep focusing a Zoom share toolbar, annotation bar, or similar overlay, or opening the tray overflow, from switching the monitor to another workspace
+- Leave Zoom's screen-sharing toolbar and share preview on screen across workspaces. The toolbar has a taskbar button but is owned by a sharing overlay or a hidden toolbar holder, so every owner up the chain is now checked
+- Release an adopted window once its app turns it into an overlay, and never switch workspaces when one is focused; Zoom attaches its share toolbar to the sharing overlay only after showing it
+- Log window captures and animation frames that stall, to pinpoint slowdowns during screen sharing
 - Release such windows saved by earlier versions on startup without popping them back up
 - Limit restart memory to apps' top-level windows, so a newly opened dialog or popup is no longer hidden as the "restart" of one closed on another workspace
 - Keep the debug log open instead of reopening it for every line, which took about 8 ms each and made up most of a workspace switch's delay

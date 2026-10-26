@@ -46,6 +46,14 @@ TestTransientWindows() {
     palette := Gui("-Caption +ToolWindow +Owner" app.Hwnd " -DPIScale")
     floatingBar := Gui("-Caption +ToolWindow +AlwaysOnTop +Owner" app.Hwnd " -DPIScale")
     dialog := Gui("+Owner" app.Hwnd " -DPIScale", "IMW owned dialog")
+    ; Zoom's screen-sharing toolbar asks for a taskbar button. While sharing
+    ; it is owned by a click-through annotation overlay; before and after, by
+    ; a hidden toolbar holder that the meeting window owns.
+    shareOverlay := Gui("-Caption +ToolWindow +AlwaysOnTop +E0x80020 -DPIScale")
+    shareToolbar := Gui("-Caption +AlwaysOnTop +E0x40000 +Owner" shareOverlay.Hwnd " -DPIScale")
+    toolbarHolder := Gui("-Caption +ToolWindow +E0x08000000 +Owner" app.Hwnd " -DPIScale")
+    heldToolbar := Gui("-Caption +E0x40000 +Owner" toolbarHolder.Hwnd " -DPIScale")
+    reowned := Gui("-Caption +E0x40000 -DPIScale")
     try {
         AssertTransient(IsWorkspaceWindowKind(app.Hwnd), "an ordinary app window is managed")
         AssertTransient(IsWorkspaceWindowKind(dialog.Hwnd), "an app's dialog is managed")
@@ -56,6 +64,11 @@ TestTransientWindows() {
             "a window that never takes focus is not managed")
         AssertTransient(!IsWorkspaceWindowKind(clickThrough.Hwnd),
             "a click-through overlay is not managed")
+        AssertTransient(!IsWorkspaceWindowKind(shareToolbar.Hwnd)
+            && !ResolveTrackedWorkspaceWindow(shareToolbar.Hwnd),
+            "a taskbar-listed toolbar owned by an overlay is not managed")
+        AssertTransient(!IsWorkspaceWindowKind(heldToolbar.Hwnd),
+            "a toolbar owned by an overlay that an app window owns is not managed")
         AssertTransient(!IsWorkspaceWindowKind(palette.Hwnd),
             "a palette is not managed while its app is not")
         WindowWorkspace[app.Hwnd] := {monitor: monitor, workspace: 1}
@@ -108,6 +121,16 @@ TestTransientWindows() {
         AssertTransient(!WindowRestartIdentity.Has(dialog.Hwnd),
             "owned dialogs and popups are not remembered for restarts")
 
+        ; Zoom shows its share toolbar first and attaches it to the sharing
+        ; overlay afterwards, so the background scan could adopt it in between.
+        WindowWorkspace[reowned.Hwnd] := {monitor: monitor, workspace: 3}
+        DllCall("SetWindowLongPtr", "ptr", reowned.Hwnd, "int", -8, "ptr", shareOverlay.Hwnd) ; GWLP_HWNDPARENT
+        AssertTransient(!QueueExternalWorkspaceActivation(reowned.Hwnd, "test"),
+            "focusing a window that became an overlay does not switch workspaces")
+        RefreshClosedAppWorkspaces()
+        AssertTransient(!WindowWorkspace.Has(reowned.Hwnd) && WindowWorkspace.Has(app.Hwnd)
+            && WindowWorkspace.Has(palette.Hwnd), "a window that became an overlay is released")
+
         ; Every line used to reopen the log, about 8 ms each; a switch logs
         ; dozens. Lines must still be on disk at once for crash diagnosis.
         startedAt := A_TickCount
@@ -118,7 +141,8 @@ TestTransientWindows() {
         AssertTransient(InStr(FileRead(DEBUG_LOG_PATH, "UTF-8"), "[TRANSIENT_TEST] line=400"),
             "log lines are flushed immediately")
     } finally {
-        for fixture in [floatingBar, palette, dialog, osd, noActivate, clickThrough, listedTool, app]
+        for fixture in [reowned, shareToolbar, shareOverlay, heldToolbar, toolbarHolder,
+            floatingBar, palette, dialog, osd, noActivate, clickThrough, listedTool, app]
             fixture.Destroy()
     }
 }

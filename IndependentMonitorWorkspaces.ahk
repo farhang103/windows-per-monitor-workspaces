@@ -1363,6 +1363,10 @@ QueueExternalWorkspaceActivation(hwnd, source, eventTime := 0) {
     current := CurrentWorkspace[slot.monitor]
     if slot.workspace = current
         return false
+    ; Focus on an overlay never moves the monitor, including in the moment
+    ; before the background scan releases a window that has become one.
+    if !IsWorkspaceWindowKind(hwnd)
+        return false
     if SuppressRestartActivation(hwnd, slot)
         return true
     if PendingExternalActivations.Has(hwnd)
@@ -1992,7 +1996,7 @@ RememberClosedAppWorkspace(hwnd) {
 
 RefreshClosedAppWorkspaces() {
     global WindowWorkspace, WindowRestartIdentity, RecentAppWorkspaces
-    global RestartActivationUntil, APP_RESTART_MEMORY_MS
+    global RestartActivationUntil, APP_RESTART_MEMORY_MS, HiddenByScript
     for key, record in RecentAppWorkspaces.Clone() {
         if A_TickCount - record.closedAt > APP_RESTART_MEMORY_MS
             RecentAppWorkspaces.Delete(key)
@@ -2008,9 +2012,23 @@ RefreshClosedAppWorkspaces() {
                 || WinGetPID("ahk_id " hwnd) = WindowRestartIdentity[hwnd].pid)
         if !alive
             ForgetWindow(hwnd)
+        ; Apps restyle and re-own windows after showing them; Zoom attaches
+        ; its share toolbar to the sharing overlay only after it appears. A
+        ; window this script hid waits until a visit shows it again.
+        else if !HiddenByScript.Has(hwnd) && !IsWorkspaceWindowKind(hwnd)
+            ReleaseWorkspaceWindow(hwnd)
         else
             RememberWindowRestartIdentity(hwnd)
     }
+}
+
+ReleaseWorkspaceWindow(hwnd) {
+    global WindowRestartIdentity
+    DebugLog("WINDOW_RELEASE", "reason=not-a-workspace-window " DebugDescribeWindow(hwnd))
+    ; Released rather than closed, so a relaunch must not inherit its slot.
+    if WindowRestartIdentity.Has(hwnd)
+        WindowRestartIdentity.Delete(hwnd)
+    ForgetWindow(hwnd)
 }
 
 TryRestoreRestartedWindow(hwnd, monitor) {
@@ -2226,6 +2244,15 @@ IsWorkspaceWindowKind(hwnd) {
         return false
     if exStyle & 0x20 ; WS_EX_TRANSPARENT
         return false
+    ; A window owned by an overlay belongs to that overlay, even one asking for
+    ; a taskbar button. Zoom's screen-sharing toolbar does, and is owned by a
+    ; hidden toolbar holder that the meeting window owns, so check every owner
+    ; up the chain rather than only the top one.
+    try owner := DllCall("GetWindow", "ptr", hwnd, "uint", 4, "ptr") ; GW_OWNER
+    catch
+        owner := 0
+    if owner && !IsWorkspaceWindowKind(owner)
+        return false
     if exStyle & 0x40000 ; WS_EX_APPWINDOW
         return true
     if exStyle & 0x08000000 ; WS_EX_NOACTIVATE
@@ -2233,14 +2260,14 @@ IsWorkspaceWindowKind(hwnd) {
     if !(exStyle & 0x80) ; WS_EX_TOOLWINDOW
         return true
     ; An app's own palettes and drawn frame shadows still follow it, because
-    ; hiding the app does not hide the windows it owns.
-    if exStyle & 0x8 ; WS_EX_TOPMOST
+    ; hiding the app does not hide the windows it owns. Always-on-top ones
+    ; float above every workspace.
+    if !owner || exStyle & 0x8 ; WS_EX_TOPMOST
         return false
-    try owner := DllCall("GetAncestor", "ptr", hwnd, "uint", 3, "ptr") ; GA_ROOTOWNER
+    try rootOwner := DllCall("GetAncestor", "ptr", hwnd, "uint", 3, "ptr") ; GA_ROOTOWNER
     catch
         return false
-    return owner && owner != hwnd && WindowWorkspace.Has(owner)
-        && IsWorkspaceWindowKind(owner)
+    return WindowWorkspace.Has(rootOwner)
 }
 
 IsVisible(hwnd) {
@@ -2539,7 +2566,13 @@ CaptureWindowSnapshot(hwnd, allowScreenCapture := true) {
     oldBitmap := DllCall("SelectObject", "ptr", memoryDc, "ptr", bitmap, "ptr")
     captured := false
     if IsWindowResponsive(hwnd) {
+        printStarted := A_TickCount
         try captured := DllCall("PrintWindow", "ptr", hwnd, "ptr", memoryDc, "uint", 2, "int") != 0
+        ; A responsive app can still take seconds here when the compositor is
+        ; busy, as during a screen share. Record which window it was.
+        if A_TickCount - printStarted > 150
+            DebugLog("SNAPSHOT_PRINT_SLOW", "elapsedMs=" (A_TickCount - printStarted)
+                " " DebugDescribeWindow(hwnd))
     } else
         DebugLog("SNAPSHOT_PRINT_SKIP", "reason=unresponsive " DebugDescribeWindow(hwnd))
     ; The screen only holds this window's pixels while it is shown.
@@ -3309,9 +3342,14 @@ RunWorkspaceSlideAnimation(state) {
 
         renderStarted := A_TickCount
         RenderWorkspaceSlideFrame(state)
+        flushStarted := A_TickCount
         try DllCall("dwmapi\DwmFlush")
         presented := A_TickCount
         renderMs := presented - renderStarted
+        if renderMs > 250
+            DebugLog("SLIDE_FRAME_SLOW", "monitor=" state.monitor
+                " drawMs=" (flushStarted - renderStarted)
+                " compositorWaitMs=" (presented - flushStarted))
         maxRenderMs := Max(maxRenderMs, renderMs)
         frameCount += 1
         if frameCount > 1 {
@@ -3704,9 +3742,7 @@ LoadWorkspaceState() {
     for hwnd in WindowWorkspace.Clone() {
         if IsWorkspaceWindowKind(hwnd)
             continue
-        DebugLog("STATE_WINDOW_RELEASE", "reason=not-a-workspace-window "
-            DebugDescribeWindow(hwnd))
-        ForgetWindow(hwnd)
+        ReleaseWorkspaceWindow(hwnd)
         if RestoredSelfHiddenWindows.Has(hwnd)
             RestoredSelfHiddenWindows.Delete(hwnd)
         restoredWindows -= 1

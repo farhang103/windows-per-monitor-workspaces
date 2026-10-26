@@ -8,7 +8,7 @@ $functions = $source.Substring($source.IndexOf("`nInitializeMonitors() {"))
 # Run actual discovery, cleanup, matching, and activation against deterministic
 # windows. No user windows, input, or persistent state are touched.
 $harness = $globals + "`nRunRestartTests()`nExitApp(0)`n" + $functions
-foreach ($name in @('IsManageableWindow', 'IsVisible', 'GetWindowMonitor', 'HideWindowFast',
+foreach ($name in @('IsManageableWindow', 'IsWorkspaceWindowKind', 'IsVisible', 'GetWindowMonitor', 'HideWindowFast',
     'DebugLog', 'DebugDescribeWindow', 'InvalidateWorkspaceFrame', 'PromoteWorkspaceWindow',
     'RemoveWindowFromWorkspaceOrders', 'DeleteWindowSnapshot')) {
     $harness = [regex]::Replace($harness, '(?m)^' + $name + '\(', 'Native_' + $name + '(')
@@ -173,6 +173,7 @@ Test_WinGetList(*) {
     return result
 }
 IsManageableWindow(hwnd) => TestWindows.Has(hwnd)
+IsWorkspaceWindowKind(hwnd) => TestWindows.Has(hwnd)
 IsVisible(hwnd) => TestWindows[hwnd].visible
 GetWindowMonitor(hwnd) => TestWindows[hwnd].monitor
 HideWindowFast(hwnd) {
