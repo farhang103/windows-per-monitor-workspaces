@@ -21,6 +21,8 @@ SetWinDelay -1
 OnMessage(0x000F, PaintWorkspaceOverview)
 OnMessage(0x0014, HandleWorkspaceSlideEraseBackground)
 SetTimer((*) => ExitApp(2), -15000)
+; The engine records the monitor layout at startup.
+SetMonitorTopology(ReadMonitorTopology())
 try {
     TestDesktopBackgroundFrames()
     TestUncachedSwitchCapture()

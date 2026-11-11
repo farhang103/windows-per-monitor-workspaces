@@ -32,6 +32,8 @@ RunDragTests() {
     global TestWindows, TestDragged, TestAnimations, TestMonitor, TestRestored
     WorkspaceStatePersistenceEnabled := false
     OverviewPreviewMode := true
+    ; The engine records the monitor layout at startup.
+    SetMonitorTopology(ReadMonitorTopology())
     TestWindows := Map(101, true, 102, true, 201, false, 301, false)
     TestDragged := 101
     TestMonitor := 1

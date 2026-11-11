@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.23 - 2026-11-10
+
+- Remember a monitor's windows when it disconnects, as when its input is switched to a game console, and put them back when it returns. Any display change used to reveal every hidden window on every monitor and reset all monitors to D1
+- Keep apps from a disconnected monitor's visible workspace in the workspace shown where Windows moved them, and keep the ones on its other workspaces hidden until it returns
+- Return each app to its monitor, position, size, maximized or minimized state, and workspace on reconnect, and the monitor to the D-number it showed. Hidden apps move back without being shown
+- Put back windows Windows moved while a monitor blinked off and on, and keep workspaces with their monitor when Windows renumbers the monitors
+- Fit returning windows to a monitor that comes back at a different position or resolution
+- Hold the window scan, workspace switches, taskbar-activation follow, and state saves until a display change settles, so windows Windows moves between monitors keep their workspaces
+- Keep disconnected monitors' windows and active D-numbers in saved state, so an engine restart while a monitor is away keeps them waiting
+- Bring a waiting window onto the main monitor when its app shows it or when everything is revealed, instead of showing it where the disconnected monitor was
+- Add a display-reconnect regression test, and record the monitor layout in the older tests' harnesses as the engine does at startup
+
 ## 1.2.22 - 2026-10-26
 
 - Slide a workspace in exactly as it will look when no recent capture of it exists. A window closing, moving, or restarting there, or an engine restart, discards that capture, and the frame rebuilt from window snapshots used to show a near-black screen until the windows appeared

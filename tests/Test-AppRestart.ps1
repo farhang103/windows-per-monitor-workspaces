@@ -24,6 +24,8 @@ RunRestartTests() {
     global WorkspaceStatePersistenceEnabled, TaskbarActivationShields, PendingExternalActivations
     global Switching, WorkspaceOverview
     WorkspaceStatePersistenceEnabled := false
+    ; The engine records the monitor layout at startup.
+    SetMonitorTopology(ReadMonitorTopology())
     ResetFixture()
     AddWindow(101, 10)
     LearnVisibleWindows()

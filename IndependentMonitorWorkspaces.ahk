@@ -6,7 +6,7 @@ Persistent
 ; This intentionally stays on one native Windows virtual desktop and emulates
 ; independent desktops by showing/hiding only the windows on the selected monitor.
 
-APP_VERSION := "1.2.22"
+APP_VERSION := "1.2.23"
 WORKSPACE_COUNT := 3
 SHOW_FEEDBACK := true
 WORKSPACE_SLIDE_MS := 340
@@ -58,6 +58,23 @@ global ForegroundWinEventCallback := 0
 global ForegroundWinEventHook := 0
 global TaskbarActivationShields := Map()
 global CarriedWorkspaceWindow := 0
+; Monitors are numbered by Windows' enumeration order, which changes when a
+; display disconnects or reconnects. The layout the slots were numbered in is
+; kept here, with each monitor's \\.\DISPLAYn device name and geometry.
+global MonitorTopology := []
+global MonitorTopologyKey := ""
+global DisplayTopologyPending := false
+global DisplayTopologyLastSeen := ""
+DISPLAY_SETTLE_MS := 1500
+; Where each window sat moments ago, refreshed while the layout is stable, so
+; windows Windows moves off a disconnecting monitor can be put back.
+global WindowPlacements := Map()
+global PlacementRestores := Map()
+; Windows, workspace stacks and active workspaces of monitors that are gone,
+; kept until the monitor returns.
+global DisplacedWindows := Map()
+global DisplacedMonitors := Map()
+global DisplacedWindowOrders := Map()
 global DEBUG_LOG_PATH := GetWorkspaceStoragePath("debug.log")
 global DEBUG_PREVIOUS_LOG_PATH := GetWorkspaceStoragePath("debug.previous.log")
 global DEBUG_MAX_BYTES := 4 * 1024 * 1024
@@ -204,15 +221,75 @@ ShowFeedbackForMonitor(readyMonitor,
 
 InitializeMonitors() {
     global CurrentWorkspace
-    monitorCount := MonitorGetCount()
-    DebugLog("MONITORS_INIT", "count=" monitorCount " primary=" MonitorGetPrimary())
-    Loop monitorCount {
-        CurrentWorkspace[A_Index] := 1
-        MonitorGet(A_Index, &left, &top, &right, &bottom)
-        DebugLog("MONITOR", "index=" A_Index " name=" MonitorGetName(A_Index)
-            " bounds=" left "," top "," right "," bottom
-            " dpi=" GetMonitorDpi(A_Index) " current=D1")
+    topology := ReadMonitorTopology()
+    SetMonitorTopology(topology)
+    DebugLog("MONITORS_INIT", "count=" topology.Length " primary=" MonitorGetPrimary())
+    for index, entry in topology {
+        CurrentWorkspace[index] := 1
+        DebugLog("MONITOR", "index=" index " name=" entry.name
+            " bounds=" entry.left "," entry.top "," entry.right "," entry.bottom
+            " dpi=" GetMonitorDpi(index) " current=D1")
     }
+}
+
+ReadMonitorEntry(index) {
+    try {
+        name := MonitorGetName(index)
+        MonitorGet(index, &left, &top, &right, &bottom)
+        MonitorGetWorkArea(index, &workLeft, &workTop, &workRight, &workBottom)
+    } catch
+        return false
+    return {name: name, device: StrLower(name),
+        left: left, top: top, right: right, bottom: bottom,
+        workLeft: workLeft, workTop: workTop, workRight: workRight, workBottom: workBottom}
+}
+
+ReadMonitorTopology() {
+    topology := []
+    Loop MonitorGetCount() {
+        entry := ReadMonitorEntry(A_Index)
+        ; Keep the numbering intact even if a monitor vanished mid-read; its
+        ; empty name keeps the layout from being taken as settled.
+        topology.Push(entry ? entry : {name: "", device: "",
+            left: 0, top: 0, right: 0, bottom: 0,
+            workLeft: 0, workTop: 0, workRight: 0, workBottom: 0})
+    }
+    return topology
+}
+
+SetMonitorTopology(topology) {
+    global MonitorTopology, MonitorTopologyKey, DisplayTopologyLastSeen
+    MonitorTopology := topology
+    MonitorTopologyKey := MonitorTopologySignature(topology)
+    DisplayTopologyLastSeen := MonitorTopologyKey
+}
+
+MonitorTopologySignature(topology) {
+    signature := ""
+    for index, entry in topology
+        signature .= (index > 1 ? "|" : "") entry.device ":" entry.left "," entry.top
+            . "," entry.right "," entry.bottom
+    return signature
+}
+
+CurrentMonitorSignature() {
+    ; Names and bounds only: this runs with every 250 ms window scan.
+    signature := ""
+    try {
+        Loop MonitorGetCount() {
+            MonitorGet(A_Index, &left, &top, &right, &bottom)
+            signature .= (A_Index > 1 ? "|" : "") StrLower(MonitorGetName(A_Index))
+                . ":" left "," top "," right "," bottom
+        }
+    } catch
+        signature .= "|unreadable"
+    return signature
+}
+
+SameMonitorGeometry(a, b) {
+    return a.left = b.left && a.top = b.top && a.right = b.right && a.bottom = b.bottom
+        && a.workLeft = b.workLeft && a.workTop = b.workTop
+        && a.workRight = b.workRight && a.workBottom = b.workBottom
 }
 
 GetWorkspaceStoragePath(fileName, stateStore := false) {
@@ -258,6 +335,12 @@ SwitchToWorkspaceOnMonitor(workspace, monitor, direction := 0, rapid := false,
         " direction=" direction " rapid=" rapid " switching=" Switching)
     if workspace < 1 || workspace > WORKSPACE_COUNT {
         DebugLog("SWITCH_REJECT", "reason=invalid-workspace target=" workspace)
+        return false
+    }
+    ; Monitor numbers are stale until a display change settles.
+    if DisplayTopologyChanging() {
+        DebugLog("SWITCH_REJECT", "reason=display-change target=D" workspace
+            " monitor=" monitor)
         return false
     }
     RequestedWorkspace[monitor] := workspace
@@ -574,6 +657,10 @@ MoveActiveWindowToWorkspace(workspace, *) {
             " manageable=" (hwnd ? IsManageableWindow(hwnd) : false))
         return
     }
+    if DisplayTopologyChanging() {
+        DebugLog("MOVE_REJECT", "target=D" workspace " reason=display-change")
+        return
+    }
 
     EnsureMonitorState()
     monitor := GetWindowMonitor(hwnd)
@@ -614,6 +701,10 @@ ShowWorkspaceOverview(monitor := 0, *) {
 
     if WorkspaceOverview
         CloseWorkspaceOverview(false)
+    if !OverviewPreviewMode && DisplayTopologyChanging() {
+        DebugLog("OVERVIEW_REJECT", "reason=display-change")
+        return
+    }
     if !monitor
         monitor := GetMonitorUnderMouse()
 
@@ -1396,6 +1487,10 @@ QueueExternalWorkspaceActivation(hwnd, source, eventTime := 0) {
     ; before the background scan releases a window that has become one.
     if !IsWorkspaceWindowKind(hwnd)
         return false
+    ; Windows activates windows it moves off a disconnecting monitor, and
+    ; monitor numbers are stale until the change settles.
+    if DisplayTopologyChanging()
+        return false
     if SuppressRestartActivation(hwnd, slot)
         return true
     if PendingExternalActivations.Has(hwnd)
@@ -1430,9 +1525,13 @@ QueueExternalWorkspaceActivation(hwnd, source, eventTime := 0) {
 ProcessPendingExternalActivations(*) {
     global CurrentWorkspace, WindowWorkspace, HiddenByScript
     global Switching, WorkspaceOverview, ExternalActivationHandling
-    global PendingExternalActivations, TaskbarActivationShields
+    global PendingExternalActivations, TaskbarActivationShields, DisplayTopologyPending
     if !PendingExternalActivations.Count
         return
+    if DisplayTopologyPending {
+        PendingExternalActivations.Clear()
+        return
+    }
     if ExternalActivationHandling || Switching || WorkspaceOverview {
         SetTimer(ProcessPendingExternalActivations, -15)
         return
@@ -1971,8 +2070,10 @@ SimulateTaskbarWorkspaceActivation(monitor) {
 
 CheckRestartedWorkspaceWindows(*) {
     global Switching, ExternalActivationHandling, WorkspaceOverview
-    if !Switching && !ExternalActivationHandling && !WorkspaceOverview
-        LearnVisibleWindows()
+    if Switching || ExternalActivationHandling || WorkspaceOverview
+        return
+    LearnVisibleWindows()
+    RememberWindowPlacements()
 }
 
 GetWindowRestartIdentity(hwnd) {
@@ -2048,6 +2149,17 @@ RefreshClosedAppWorkspaces() {
             ReleaseWorkspaceWindow(hwnd)
         else
             RememberWindowRestartIdentity(hwnd)
+    }
+    ; Windows waiting for a disconnected monitor are not in a workspace.
+    global DisplacedWindows
+    for hwnd, home in DisplacedWindows.Clone() {
+        alive := false
+        try alive := WinExist("ahk_id " hwnd) && WinGetPID("ahk_id " hwnd) = home.pid
+        if alive
+            continue
+        DisplacedWindows.Delete(hwnd)
+        if !WindowWorkspace.Has(hwnd) && HiddenByScript.Has(hwnd)
+            HiddenByScript.Delete(hwnd)
     }
 }
 
@@ -2127,8 +2239,14 @@ LearnVisibleWindows() {
         DebugLog("WINDOW_SCAN_SKIP", "reason=preview-mode tracked=" WindowWorkspace.Count)
         return
     }
+    ; While displays change, Windows moves windows between monitors and the
+    ; monitor numbers shift. Learning from that would scatter every window's
+    ; workspace; the change is reconciled once it settles.
+    if DisplayTopologyChanging()
+        return
 
     RefreshClosedAppWorkspaces()
+    AdoptReshownDisplacedWindows()
 
     learned := 0
     moved := 0
@@ -2162,7 +2280,8 @@ LearnVisibleWindows() {
         ; A visible window dragged to another monitor joins the workspace that is
         ; currently displayed there.
         slot := WindowWorkspace[hwnd]
-        if slot.monitor != monitor {
+        ; A window being put back after a display change is still on its way.
+        if slot.monitor != monitor && !PlacementRestores.Has(hwnd) {
             oldMonitor := slot.monitor
             oldWorkspace := slot.workspace
             WindowWorkspace[hwnd] := {
@@ -2933,7 +3052,12 @@ ResumePendingWorkspaceRecovery() {
 ForgetWindow(hwnd) {
     global WindowWorkspace, HiddenByScript
     global WindowRestartIdentity, RestartActivationUntil
+    global DisplacedWindows, WindowPlacements, PlacementRestores
     RememberClosedAppWorkspace(hwnd)
+    for record in [DisplacedWindows, WindowPlacements, PlacementRestores] {
+        if record.Has(hwnd)
+            record.Delete(hwnd)
+    }
     if WindowRestartIdentity.Has(hwnd)
         WindowRestartIdentity.Delete(hwnd)
     if RestartActivationUntil.Has(hwnd)
@@ -2951,9 +3075,503 @@ ForgetWindow(hwnd) {
 
 HandleDisplayChange(*) {
     ; Windows broadcasts WM_DISPLAYCHANGE after monitor connect/disconnect,
-    ; resolution changes, docking, and topology changes. Debounce the reset.
-    DebugLog("DISPLAY_CHANGE", "debounceMs=750")
-    SetTimer(ResetAfterDisplayChange, -750)
+    ; resolution changes, docking, and topology changes. Switching a monitor's
+    ; input to a console disconnects it, often only for a second.
+    global DISPLAY_SETTLE_MS
+    DebugLog("DISPLAY_CHANGE", "settleMs=" DISPLAY_SETTLE_MS)
+    BeginDisplayTopologyChange("display-change")
+}
+
+DisplayTopologyChanging() {
+    ; Windows can move windows off a disconnecting monitor before this script
+    ; receives WM_DISPLAYCHANGE, so the monitor list is checked directly too.
+    global DisplayTopologyPending, MonitorTopologyKey
+    if DisplayTopologyPending
+        return true
+    if CurrentMonitorSignature() = MonitorTopologyKey
+        return false
+    BeginDisplayTopologyChange("monitor-scan")
+    return true
+}
+
+BeginDisplayTopologyChange(reason) {
+    global DisplayTopologyPending, DisplayTopologyLastSeen, MonitorTopologyKey
+    global PendingWorkspaceSwitches, PendingExternalActivations, DISPLAY_SETTLE_MS
+    signature := CurrentMonitorSignature()
+    DebugLog("DISPLAY_TOPOLOGY_CHANGE", "reason=" reason
+        " pending=" DisplayTopologyPending " previous=" MonitorTopologyKey
+        " current=" signature)
+    DisplayTopologyPending := true
+    DisplayTopologyLastSeen := signature
+    PendingWorkspaceSwitches.Clear()
+    PendingExternalActivations.Clear()
+    SetTimer(SettleDisplayTopologyChange, -DISPLAY_SETTLE_MS)
+}
+
+SettleDisplayTopologyChange(*) {
+    global DisplayTopologyPending, DisplayTopologyLastSeen, DISPLAY_SETTLE_MS
+    global Switching, ExternalActivationHandling
+    if !DisplayTopologyPending
+        return
+    if Switching || ExternalActivationHandling {
+        SetTimer(SettleDisplayTopologyChange, -300)
+        return
+    }
+    topology := ReadMonitorTopology()
+    signature := MonitorTopologySignature(topology)
+    settled := topology.Length > 0 && signature = DisplayTopologyLastSeen
+    for entry in topology {
+        if !entry.device
+            settled := false
+    }
+    if !settled {
+        DisplayTopologyLastSeen := signature
+        DebugLog("DISPLAY_TOPOLOGY_WAIT", "current=" signature)
+        SetTimer(SettleDisplayTopologyChange, -DISPLAY_SETTLE_MS)
+        return
+    }
+    ReconcileDisplayTopology(topology)
+}
+
+ReconcileDisplayTopology(topology, reason := "settled") {
+    ; Carry every window, workspace stack and active workspace from the old
+    ; monitor numbering to the new one by device name. Windows whose monitor
+    ; left wait for it: the ones Windows moved onto another monitor join the
+    ; workspace shown there, the hidden ones stay hidden. When a monitor comes
+    ; back, its windows return to their places and workspaces.
+    global MonitorTopology, CurrentWorkspace, RequestedWorkspace, WindowWorkspace
+    global HiddenByScript, WorkspaceWindowOrders, RecentAppWorkspaces
+    global WindowPlacements, DisplacedWindows, DisplacedMonitors, DisplacedWindowOrders
+    global DisplayTopologyPending, PendingWorkspaceSwitches, WorkspaceSlideSkipRequests
+    global PendingExternalActivations, CarriedWorkspaceWindow, OverviewHotCornerMonitor
+    previousCritical := Critical("On")
+    try {
+        oldTopology := MonitorTopology
+        newIndex := Map()
+        for index, entry in topology
+            newIndex[entry.device] := index
+        oldIndex := Map()
+        for index, entry in oldTopology
+            oldIndex[entry.device] := index
+        DebugLog("DISPLAY_TOPOLOGY_RECONCILE", "reason=" reason
+            " from=" MonitorTopologySignature(oldTopology)
+            " to=" MonitorTopologySignature(topology))
+
+        ; Frames, indicators and shields were drawn for the old layout.
+        CloseWorkspaceOverview(false)
+        ClearWorkspaceOverlays()
+        ClearTaskbarActivationShields("display-change")
+        ClearWorkspaceFrames()
+        ClearDesktopBackgrounds()
+        PendingWorkspaceSwitches.Clear()
+        WorkspaceSlideSkipRequests.Clear()
+        PendingExternalActivations.Clear()
+        SetTimer(FinishWorkspaceWindowDrag, 0)
+        CarriedWorkspaceWindow := 0
+        OverviewHotCornerMonitor := 0
+        ; Closed windows go first, while restart memory still uses old numbers.
+        for hwnd in WindowWorkspace.Clone() {
+            if !WinExist("ahk_id " hwnd)
+                ForgetWindow(hwnd)
+        }
+
+        ; Each monitor keeps the workspace it showed, including one returning.
+        current := Map()
+        returningMonitors := Map()
+        for index, entry in topology {
+            if oldIndex.Has(entry.device) && CurrentWorkspace.Has(oldIndex[entry.device])
+                current[index] := CurrentWorkspace[oldIndex[entry.device]]
+            else if DisplacedMonitors.Has(entry.device) {
+                current[index] := DisplacedMonitors[entry.device].workspace
+                returningMonitors[entry.device] := true
+                DisplacedMonitors.Delete(entry.device)
+            } else
+                current[index] := 1
+        }
+        for index, entry in oldTopology {
+            if entry.device && !newIndex.Has(entry.device)
+                DisplacedMonitors[entry.device] := {name: entry.name, monitor: entry,
+                    workspace: CurrentWorkspace.Has(index) ? CurrentWorkspace[index] : 1}
+        }
+        CurrentWorkspace.Clear()
+        RequestedWorkspace.Clear()
+        for index, workspace in current {
+            CurrentWorkspace[index] := workspace
+            RequestedWorkspace[index] := workspace
+        }
+
+        ; Workspace stacks follow their monitor.
+        orders := Map()
+        for key, order in WorkspaceWindowOrders {
+            parts := StrSplit(key, ":")
+            monitor := Integer(parts[1])
+            if monitor < 1 || monitor > oldTopology.Length
+                continue
+            device := oldTopology[monitor].device
+            if newIndex.Has(device)
+                orders[newIndex[device] ":" parts[2]] := order
+            else
+                DisplacedWindowOrders[device "|" parts[2]] := order
+        }
+        for key, order in DisplacedWindowOrders.Clone() {
+            parts := StrSplit(key, "|")
+            if !newIndex.Has(parts[1])
+                continue
+            orders[newIndex[parts[1]] ":" parts[2]] := order
+            DisplacedWindowOrders.Delete(key)
+        }
+        WorkspaceWindowOrders.Clear()
+        for key, order in orders
+            WorkspaceWindowOrders[key] := order
+
+        for key, record in RecentAppWorkspaces.Clone() {
+            device := record.monitor >= 1 && record.monitor <= oldTopology.Length
+                ? oldTopology[record.monitor].device : ""
+            if newIndex.Has(device)
+                record.monitor := newIndex[device]
+            else
+                RecentAppWorkspaces.Delete(key)
+        }
+
+        ; Windows whose monitor is back.
+        homecoming := Map()
+        for hwnd, home in DisplacedWindows.Clone() {
+            alive := false
+            try alive := WinExist("ahk_id " hwnd) && WinGetPID("ahk_id " hwnd) = home.pid
+            if !alive {
+                DisplacedWindows.Delete(hwnd)
+                if !WindowWorkspace.Has(hwnd) && HiddenByScript.Has(hwnd)
+                    HiddenByScript.Delete(hwnd)
+                continue
+            }
+            if newIndex.Has(home.device) {
+                homecoming[hwnd] := home
+                DisplacedWindows.Delete(hwnd)
+            }
+        }
+
+        moved := 0
+        guests := 0
+        waiting := 0
+        for hwnd, slot in WindowWorkspace.Clone() {
+            if homecoming.Has(hwnd)
+                continue
+            device := slot.monitor >= 1 && slot.monitor <= oldTopology.Length
+                ? oldTopology[slot.monitor].device : ""
+            if !device {
+                ; Not numbered in the old layout. Reveal it for the scan to place.
+                WindowWorkspace.Delete(hwnd)
+                if HiddenByScript.Has(hwnd) {
+                    ShowWindowFast(hwnd)
+                    HiddenByScript.Delete(hwnd)
+                }
+                continue
+            }
+            if newIndex.Has(device) {
+                monitor := newIndex[device]
+                WindowWorkspace[hwnd] := {monitor: monitor, workspace: slot.workspace}
+                ; Windows moved it off its monitor, e.g. while the monitor
+                ; blinked off and back on.
+                if WindowPlacements.Has(hwnd) && WindowPlacements[hwnd].device = device
+                    && RestoreWindowPlacement(hwnd, WindowPlacements[hwnd],
+                        oldTopology[slot.monitor], topology, monitor)
+                    moved += 1
+                continue
+            }
+
+            ; Its monitor left. A window already waiting keeps its first home.
+            if !DisplacedWindows.Has(hwnd) {
+                try pid := WinGetPID("ahk_id " hwnd)
+                catch
+                    pid := 0
+                placement := WindowPlacements.Has(hwnd)
+                    && WindowPlacements[hwnd].device = device ? WindowPlacements[hwnd] : false
+                DisplacedWindows[hwnd] := {name: oldTopology[slot.monitor].name,
+                    device: device, workspace: slot.workspace, pid: pid,
+                    placement: placement, monitor: oldTopology[slot.monitor]}
+            }
+            if IsVisible(hwnd) && !HiddenByScript.Has(hwnd) {
+                host := TopologyIndexForWindow(topology, hwnd)
+                if host {
+                    WindowWorkspace[hwnd] := {monitor: host, workspace: current[host]}
+                    guests += 1
+                    DebugLog("WINDOW_DISPLACED", "action=join-monitor host=" host
+                        " workspace=D" current[host] " home=" device
+                        " homeWorkspace=D" slot.workspace " " DebugDescribeWindow(hwnd))
+                    continue
+                }
+            }
+            WindowWorkspace.Delete(hwnd)
+            waiting += 1
+            DebugLog("WINDOW_DISPLACED", "action=wait-hidden home=" device
+                " homeWorkspace=D" slot.workspace " " DebugDescribeWindow(hwnd))
+        }
+
+        returned := 0
+        for hwnd, home in homecoming {
+            monitor := newIndex[home.device]
+            WindowWorkspace[hwnd] := {monitor: monitor, workspace: home.workspace}
+            if home.placement
+                RestoreWindowPlacement(hwnd, home.placement, home.monitor, topology, monitor)
+            if home.workspace = current[monitor] {
+                if HiddenByScript.Has(hwnd) {
+                    ShowWindowFast(hwnd)
+                    HiddenByScript.Delete(hwnd)
+                }
+            } else if IsVisible(hwnd) {
+                CaptureWindowSnapshot(hwnd)
+                HideWindowFast(hwnd)
+                HiddenByScript[hwnd] := true
+            }
+            returned += 1
+            DebugLog("WINDOW_RETURN", "monitor=" monitor " workspace=D" home.workspace
+                " current=D" current[monitor] " " DebugDescribeWindow(hwnd))
+        }
+        for device in returningMonitors {
+            monitor := newIndex[device]
+            SetTimer(RestoreWorkspaceWindowOrder.Bind(monitor, current[monitor]), -150)
+        }
+
+        SetMonitorTopology(topology)
+        DisplayTopologyPending := false
+        for index, entry in topology
+            DebugLog("MONITOR", "index=" index " name=" entry.name
+                " bounds=" entry.left "," entry.top "," entry.right "," entry.bottom
+                " current=D" current[index])
+        DebugLog("DISPLAY_TOPOLOGY_COMMIT", "monitors=" topology.Length
+            " moved=" moved " joined=" guests " waiting=" waiting " returned=" returned
+            " displaced=" DisplacedWindows.Count " awayMonitors=" DisplacedMonitors.Count)
+        SaveWorkspaceState()
+        SetTimer(RefreshDesktopBackgrounds, -2000)
+        for index, workspace in current
+            SetTimer(VerifyWorkspaceTransition.Bind(index, workspace, 0), -400)
+    } finally {
+        Critical(previousCritical)
+    }
+}
+
+TopologyIndexForRect(topology, rect) {
+    ; The monitor holding most of the rectangle, else the nearest, as
+    ; MonitorFromWindow does with MONITOR_DEFAULTTONEAREST.
+    best := 0
+    bestArea := 0
+    for index, entry in topology {
+        width := Min(rect.right, entry.right) - Max(rect.left, entry.left)
+        height := Min(rect.bottom, entry.bottom) - Max(rect.top, entry.top)
+        if width > 0 && height > 0 && width * height > bestArea {
+            best := index
+            bestArea := width * height
+        }
+    }
+    if best
+        return best
+    bestDistance := -1
+    for index, entry in topology {
+        dx := rect.left > entry.right ? rect.left - entry.right
+            : entry.left > rect.right ? entry.left - rect.right : 0
+        dy := rect.top > entry.bottom ? rect.top - entry.bottom
+            : entry.top > rect.bottom ? entry.top - rect.bottom : 0
+        if bestDistance < 0 || dx * dx + dy * dy < bestDistance {
+            best := index
+            bestDistance := dx * dx + dy * dy
+        }
+    }
+    return best
+}
+
+TopologyIndexForWindow(topology, hwnd) {
+    record := ReadWindowPlacement(hwnd, topology)
+    return record ? record.monitor : 0
+}
+
+GetWindowRectObject(hwnd) {
+    rect := Buffer(16, 0)
+    try {
+        if !DllCall("GetWindowRect", "ptr", hwnd, "ptr", rect.Ptr)
+            return false
+    } catch
+        return false
+    return {left: NumGet(rect, 0, "int"), top: NumGet(rect, 4, "int"),
+        right: NumGet(rect, 8, "int"), bottom: NumGet(rect, 12, "int")}
+}
+
+ReadWindowPlacement(hwnd, topology) {
+    ; GetWindowPlacement and GetWindowRect read the window manager's own
+    ; records, so a hung app cannot stall them.
+    placement := Buffer(44, 0)
+    NumPut("uint", 44, placement, 0)
+    rect := GetWindowRectObject(hwnd)
+    if !rect
+        return false
+    try {
+        if !DllCall("GetWindowPlacement", "ptr", hwnd, "ptr", placement.Ptr)
+            return false
+    } catch
+        return false
+    showCmd := NumGet(placement, 8, "uint")
+    ; A minimized window sits off screen; its restore position names its monitor.
+    area := showCmd = 2
+        ? {left: NumGet(placement, 28, "int"), top: NumGet(placement, 32, "int"),
+            right: NumGet(placement, 36, "int"), bottom: NumGet(placement, 40, "int")}
+        : rect
+    monitor := TopologyIndexForRect(topology, area)
+    return {placement: placement, showCmd: showCmd, monitor: monitor,
+        device: monitor ? topology[monitor].device : "",
+        left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom}
+}
+
+RecordWindowPlacements() {
+    global WindowWorkspace, MonitorTopology
+    placements := Map()
+    for hwnd in WindowWorkspace {
+        record := ReadWindowPlacement(hwnd, MonitorTopology)
+        if record
+            placements[hwnd] := record
+    }
+    return placements
+}
+
+RememberWindowPlacements() {
+    global WindowPlacements, DisplayTopologyPending
+    if DisplayTopologyPending
+        return
+    placements := RecordWindowPlacements()
+    ; Keep the earlier record if the displays changed during this read.
+    if DisplayTopologyChanging()
+        return
+    WindowPlacements := placements
+}
+
+MapWindowRect(rect, maximized, before, now) {
+    ; Where a window belongs on its monitor as it is now. Unchanged monitors
+    ; get the exact frame back.
+    if before && SameMonitorGeometry(before, now)
+        return {left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom}
+    if maximized && before
+        return {left: now.workLeft + rect.left - before.workLeft,
+            top: now.workTop + rect.top - before.workTop,
+            right: now.workRight + rect.right - before.workRight,
+            bottom: now.workBottom + rect.bottom - before.workBottom}
+    width := Min(rect.right - rect.left, now.workRight - now.workLeft)
+    height := Min(rect.bottom - rect.top, now.workBottom - now.workTop)
+    left := rect.left + (before ? now.left - before.left : 0)
+    top := rect.top + (before ? now.top - before.top : 0)
+    left := Max(now.workLeft, Min(left, now.workRight - width))
+    top := Max(now.workTop, Min(top, now.workBottom - height))
+    return {left: left, top: top, right: left + width, bottom: top + height}
+}
+
+MoveWindowFrame(hwnd, rect, responsive) {
+    ; NOZORDER|NOACTIVATE|NOOWNERZORDER, posted to a hung app's thread.
+    try return DllCall("SetWindowPos", "ptr", hwnd, "ptr", 0,
+        "int", rect.left, "int", rect.top,
+        "int", rect.right - rect.left, "int", rect.bottom - rect.top,
+        "uint", responsive ? 0x0214 : 0x4214, "int") != 0
+    catch
+        return false
+}
+
+RestoreWindowPlacement(hwnd, record, before, topology, monitor) {
+    global PlacementRestores
+    ; Leave a window that is already on its monitor, such as one Windows
+    ; itself put back.
+    if TopologyIndexForWindow(topology, hwnd) = monitor
+        return false
+    now := topology[monitor]
+    sameGeometry := !before || SameMonitorGeometry(before, now)
+    minimized := record.showCmd = 2
+    maximized := record.showCmd = 3
+    visible := IsVisible(hwnd)
+    responsive := IsWindowResponsive(hwnd)
+    ; The placement holds the restore position and minimized or maximized
+    ; state. It moves a minimized window home and keeps a hidden one hidden,
+    ; but leaves a maximized window's frame on the monitor it is on.
+    if (minimized || maximized) && sameGeometry {
+        placement := Buffer(44, 0)
+        DllCall("RtlMoveMemory", "ptr", placement.Ptr, "ptr", record.placement.Ptr, "uptr", 44)
+        ; SW_HIDE, SW_SHOWMINNOACTIVE or SW_SHOWNA: never activate or reveal.
+        NumPut("uint", !visible ? 0 : minimized ? 7 : 8, placement, 8)
+        if !responsive
+            NumPut("uint", NumGet(placement, 4, "uint") | 0x4, placement, 4) ; WPF_ASYNCWINDOWPLACEMENT
+        try DllCall("SetWindowPlacement", "ptr", hwnd, "ptr", placement.Ptr)
+    }
+    target := false
+    zoomed := DllCall("IsZoomed", "ptr", hwnd, "int") != 0
+    if !minimized && zoomed = maximized && !DllCall("IsIconic", "ptr", hwnd, "int") {
+        target := MapWindowRect(record, maximized, before, now)
+        MoveWindowFrame(hwnd, target, responsive)
+        ; An app that rescales itself for the new monitor's DPI is set again.
+        PlacementRestores[hwnd] := {target: target, attempts: 0}
+        SetTimer(VerifyRestoredWindowPlacements, -300)
+    }
+    DebugLog("WINDOW_PLACEMENT_RESTORE", "monitor=" monitor
+        " state=" (minimized ? "minimized" : maximized ? "maximized" : "normal")
+        " sameGeometry=" sameGeometry " responsive=" responsive
+        " target=" (target ? target.left "," target.top "," target.right "," target.bottom
+            : "placement") " " DebugDescribeWindow(hwnd))
+    return true
+}
+
+VerifyRestoredWindowPlacements(*) {
+    global PlacementRestores
+    for hwnd, restore in PlacementRestores.Clone() {
+        rect := WinExist("ahk_id " hwnd) ? GetWindowRectObject(hwnd) : false
+        target := restore.target
+        if !rect || rect.left = target.left && rect.top = target.top
+            && rect.right = target.right && rect.bottom = target.bottom {
+            PlacementRestores.Delete(hwnd)
+            continue
+        }
+        if restore.attempts >= 2 {
+            DebugLog("WINDOW_PLACEMENT_MISMATCH", "actual=" rect.left "," rect.top ","
+                rect.right "," rect.bottom " target=" target.left "," target.top ","
+                target.right "," target.bottom " " DebugDescribeWindow(hwnd))
+            PlacementRestores.Delete(hwnd)
+            continue
+        }
+        restore.attempts += 1
+        MoveWindowFrame(hwnd, target, IsWindowResponsive(hwnd))
+    }
+    if PlacementRestores.Count
+        SetTimer(VerifyRestoredWindowPlacements, -400)
+}
+
+AdoptReshownDisplacedWindows() {
+    ; An app showed a window that is waiting for its disconnected monitor.
+    ; Keep it on screen, in the workspace shown where it is, until then.
+    global DisplacedWindows, WindowWorkspace, HiddenByScript, CurrentWorkspace
+    for hwnd, home in DisplacedWindows {
+        if WindowWorkspace.Has(hwnd) || !IsVisible(hwnd)
+            continue
+        MoveDisplacedWindowOnScreen(hwnd)
+        if HiddenByScript.Has(hwnd)
+            HiddenByScript.Delete(hwnd)
+        monitor := GetWindowMonitor(hwnd)
+        WindowWorkspace[hwnd] := {monitor: monitor,
+            workspace: CurrentWorkspace.Has(monitor) ? CurrentWorkspace[monitor] : 1}
+        DebugLog("WINDOW_DISPLACED", "action=shown-by-app monitor=" monitor
+            " home=" home.device " homeWorkspace=D" home.workspace " "
+            DebugDescribeWindow(hwnd))
+        ScheduleWorkspaceStateSave()
+    }
+}
+
+MoveDisplacedWindowOnScreen(hwnd) {
+    ; A window that waited, hidden, for its monitor is still where that
+    ; monitor was. Bring it onto the main monitor before showing it.
+    global DisplacedWindows
+    if DllCall("MonitorFromWindow", "ptr", hwnd, "uint", 0, "ptr") ; MONITOR_DEFAULTTONULL
+        || DllCall("IsIconic", "ptr", hwnd, "int")
+        return false
+    now := ReadMonitorEntry(MonitorGetPrimary())
+    rect := GetWindowRectObject(hwnd)
+    if !now || !rect
+        return false
+    before := DisplacedWindows.Has(hwnd) ? DisplacedWindows[hwnd].monitor : false
+    target := MapWindowRect(rect, DllCall("IsZoomed", "ptr", hwnd, "int") != 0, before, now)
+    DebugLog("WINDOW_ONSCREEN", "target=" target.left "," target.top ","
+        target.right "," target.bottom " " DebugDescribeWindow(hwnd))
+    return MoveWindowFrame(hwnd, target, IsWindowResponsive(hwnd))
 }
 
 HandleSettingChange(wParam, *) {
@@ -2963,21 +3581,14 @@ HandleSettingChange(wParam, *) {
         SetTimer(RefreshDesktopBackgrounds, -2000)
 }
 
-ResetAfterDisplayChange() {
-    global Switching
-    if Switching {
-        SetTimer(ResetAfterDisplayChange, -300)
-        return
-    }
-    ResetAndRevealAll()
-}
-
 RestoreAllWindows(*) {
-    global HiddenByScript
+    global HiddenByScript, DisplacedWindows
     DebugLog("RESTORE_ALL_BEGIN", "count=" HiddenByScript.Count)
     for hwnd in HiddenByScript.Clone() {
         if WinExist("ahk_id " hwnd) {
             DebugLog("RESTORE_ALL_WINDOW", DebugDescribeWindow(hwnd))
+            if DisplacedWindows.Has(hwnd)
+                MoveDisplacedWindowOnScreen(hwnd)
             ShowWindowFast(hwnd)
         }
     }
@@ -3010,13 +3621,20 @@ ResetAndRevealAll(*) {
     global CurrentWorkspace, WindowWorkspace, RequestedWorkspace
     global PendingWorkspaceSwitches, WorkspaceSlideSkipRequests
     global WorkspaceWindowOrders, PendingExternalActivations
+    global DisplacedWindows, DisplacedMonitors, DisplacedWindowOrders
+    global WindowPlacements, PlacementRestores, DisplayTopologyPending
     DebugLog("RESET", "begin")
+    SetTimer(SettleDisplayTopologyChange, 0)
+    DisplayTopologyPending := false
     ClearWorkspaceOverlays()
     ClearTaskbarActivationShields("reset")
     CloseWorkspaceOverview(false)
     RestoreAllWindows()
     WindowWorkspace.Clear()
     WorkspaceWindowOrders.Clear()
+    for record in [DisplacedWindows, DisplacedMonitors, DisplacedWindowOrders,
+        WindowPlacements, PlacementRestores]
+        record.Clear()
     ClearWindowSnapshots()
     ClearWorkspaceFrames()
     ClearDesktopBackgrounds()
@@ -3978,30 +4596,47 @@ ScheduleWorkspaceStateSave(*) {
 SaveWorkspaceState(*) {
     global CurrentWorkspace, WindowWorkspace, WORKSPACE_STATE_PATH, WORKSPACE_COUNT
     global WorkspaceStatePersistenceEnabled, WorkspaceWindowOrders, HiddenByScript
+    global MonitorTopology, DisplayTopologyPending, DisplacedMonitors, DisplacedWindows
     if !WorkspaceStatePersistenceEnabled
         return
+    ; Mid-change monitor numbers would save windows under the wrong monitor.
+    ; The last state saved before the change stays until it settles.
+    if DisplayTopologyPending {
+        DebugLog("STATE_SAVE_SKIP", "reason=display-change")
+        return
+    }
     try {
         SplitPath(WORKSPACE_STATE_PATH,, &stateDirectory)
         DirCreate(stateDirectory)
         ; Refresh the stack for each workspace that is currently visible. Hidden
         ; workspaces keep the order captured immediately before they were left.
-        Loop MonitorGetCount() {
-            monitor := A_Index
+        for monitor, entry in MonitorTopology {
             if CurrentWorkspace.Has(monitor)
                 RememberWorkspaceWindowOrder(monitor, CurrentWorkspace[monitor])
         }
 
         contents := "IMW_STATE_V2`n"
-        Loop MonitorGetCount() {
-            monitor := A_Index
+        for monitor, entry in MonitorTopology {
             workspace := CurrentWorkspace.Has(monitor) ? CurrentWorkspace[monitor] : 1
-            contents .= "M`t" MonitorGetName(monitor) "`t" workspace "`n"
+            contents .= "M`t" entry.name "`t" workspace "`n"
+        }
+        ; Disconnected monitors keep their workspace and geometry, which later
+        ; versions read to put their windows back.
+        for device, away in DisplacedMonitors {
+            contents .= "M`t" away.name "`t" away.workspace
+            if away.monitor {
+                geometry := away.monitor
+                for field in ["left", "top", "right", "bottom",
+                    "workLeft", "workTop", "workRight", "workBottom"]
+                    contents .= "`t" geometry.%field%
+            }
+            contents .= "`n"
         }
         savedWindows := 0
         for hwnd, slot in WindowWorkspace {
             if !WinExist("ahk_id " hwnd)
                 continue
-            if slot.monitor < 1 || slot.monitor > MonitorGetCount()
+            if slot.monitor < 1 || slot.monitor > MonitorTopology.Length
                 continue
             try pid := WinGetPID("ahk_id " hwnd)
             catch
@@ -4009,9 +4644,28 @@ SaveWorkspaceState(*) {
             ; 0 marks a window its own app hid (tray apps, popups), which a
             ; restart must neither show nor treat as hidden by this script.
             shown := IsVisible(hwnd) || HiddenByScript.Has(hwnd) ? 1 : 0
-            contents .= "W`t" hwnd "`t" pid "`t" MonitorGetName(slot.monitor)
+            contents .= "W`t" hwnd "`t" pid "`t" MonitorTopology[slot.monitor].name
                 . "`t" slot.workspace "`t" shown "`n"
             savedWindows += 1
+        }
+        ; Each window waiting for a disconnected monitor, with its place there.
+        for hwnd, home in DisplacedWindows {
+            try pid := WinExist("ahk_id " hwnd) ? WinGetPID("ahk_id " hwnd) : 0
+            catch
+                pid := 0
+            if !pid || pid != home.pid
+                continue
+            shown := IsVisible(hwnd) || HiddenByScript.Has(hwnd) ? 1 : 0
+            contents .= "H`t" hwnd "`t" pid "`t" home.name "`t" home.workspace "`t" shown
+            if home.placement {
+                record := home.placement
+                contents .= "`t" record.showCmd "`t" NumGet(record.placement, 4, "uint")
+                Loop 8 ; minimized and maximized positions, restore rectangle
+                    contents .= "`t" NumGet(record.placement, 8 + A_Index * 4, "int")
+                contents .= "`t" record.left "`t" record.top "`t" record.right
+                    . "`t" record.bottom
+            }
+            contents .= "`n"
         }
 
         savedOrderEntries := 0
@@ -4027,7 +4681,7 @@ SaveWorkspaceState(*) {
                 catch
                     continue
                 rank += 1
-                contents .= "O`t" hwnd "`t" pid "`t" MonitorGetName(slot.monitor)
+                contents .= "O`t" hwnd "`t" pid "`t" MonitorTopology[slot.monitor].name
                     . "`t" slot.workspace "`t" rank "`n"
                 savedOrderEntries += 1
             }
@@ -4039,8 +4693,8 @@ SaveWorkspaceState(*) {
         FileAppend(contents, temporaryPath, "UTF-8")
         FileMove(temporaryPath, WORKSPACE_STATE_PATH, true)
         DebugLog("STATE_SAVE", "path=" WORKSPACE_STATE_PATH
-            " monitors=" MonitorGetCount() " windows=" savedWindows
-            " orderEntries=" savedOrderEntries)
+            " monitors=" MonitorTopology.Length " windows=" savedWindows
+            " orderEntries=" savedOrderEntries " waiting=" DisplacedWindows.Count)
     } catch as error {
         DebugLog("STATE_SAVE_ERROR", "message=" DebugClean(error.Message))
     }
@@ -4048,15 +4702,18 @@ SaveWorkspaceState(*) {
 
 LoadWorkspaceState() {
     global CurrentWorkspace, WindowWorkspace, WORKSPACE_STATE_PATH, WORKSPACE_COUNT
-    global WorkspaceWindowOrders, RestoredSelfHiddenWindows
+    global WorkspaceWindowOrders, RestoredSelfHiddenWindows, HiddenByScript
+    global MonitorTopology, DisplacedMonitors, DisplacedWindows
     if !FileExist(WORKSPACE_STATE_PATH) {
         DebugLog("STATE_LOAD", "result=missing path=" WORKSPACE_STATE_PATH)
         return false
     }
 
     monitorLookup := Map()
-    Loop MonitorGetCount()
-        monitorLookup[StrLower(MonitorGetName(A_Index))] := A_Index
+    for monitor, entry in MonitorTopology
+        monitorLookup[entry.device] := monitor
+    savedGeometry := Map()
+    homes := Map()
 
     restoredMonitors := 0
     restoredWindows := 0
@@ -4077,11 +4734,53 @@ LoadWorkspaceState() {
             try workspace := Integer(fields[3])
             catch
                 continue
-            if monitorLookup.Has(deviceName)
-                && workspace >= 1 && workspace <= WORKSPACE_COUNT {
+            if workspace < 1 || workspace > WORKSPACE_COUNT
+                continue
+            if fields.Length >= 11 {
+                try savedGeometry[deviceName] := {name: fields[2], device: deviceName,
+                    left: Integer(fields[4]), top: Integer(fields[5]),
+                    right: Integer(fields[6]), bottom: Integer(fields[7]),
+                    workLeft: Integer(fields[8]), workTop: Integer(fields[9]),
+                    workRight: Integer(fields[10]), workBottom: Integer(fields[11])}
+            }
+            if monitorLookup.Has(deviceName) {
                 CurrentWorkspace[monitorLookup[deviceName]] := workspace
                 restoredMonitors += 1
+            } else
+                DisplacedMonitors[deviceName] := {name: fields[2], workspace: workspace,
+                    monitor: savedGeometry.Has(deviceName) ? savedGeometry[deviceName] : false}
+            continue
+        }
+        if fields.Length >= 6 && fields[1] = "H" {
+            try {
+                hwnd := Integer(fields[2])
+                expectedPid := Integer(fields[3])
+                workspace := Integer(fields[5])
+                shown := Integer(fields[6])
+                actualPid := WinExist("ahk_id " hwnd) ? WinGetPID("ahk_id " hwnd) : 0
+            } catch
+                continue
+            if !actualPid || actualPid != expectedPid
+                || workspace < 1 || workspace > WORKSPACE_COUNT
+                continue
+            placement := false
+            if fields.Length >= 20 {
+                try {
+                    stored := Buffer(44, 0)
+                    NumPut("uint", 44, stored, 0)
+                    NumPut("uint", Integer(fields[8]), stored, 4)
+                    NumPut("uint", Integer(fields[7]), stored, 8)
+                    Loop 8
+                        NumPut("int", Integer(fields[8 + A_Index]), stored, 8 + A_Index * 4)
+                    placement := {placement: stored, showCmd: Integer(fields[7]),
+                        device: StrLower(fields[4]), monitor: 0,
+                        left: Integer(fields[17]), top: Integer(fields[18]),
+                        right: Integer(fields[19]), bottom: Integer(fields[20])}
+                }
             }
+            homes[hwnd] := {name: fields[4], device: StrLower(fields[4]),
+                workspace: workspace, pid: expectedPid, shown: shown,
+                placement: placement, monitor: false}
             continue
         }
         if fields.Length >= 6 && fields[1] = "O" {
@@ -4149,6 +4848,36 @@ LoadWorkspaceState() {
             " shown=" shown " " DebugDescribeWindow(hwnd))
     }
 
+    ; Windows that were waiting for a disconnected monitor.
+    for hwnd, home in homes {
+        home.monitor := savedGeometry.Has(home.device) ? savedGeometry[home.device] : false
+        if monitorLookup.Has(home.device) {
+            ; Their monitor came back while the engine was stopped.
+            monitor := monitorLookup[home.device]
+            if !WindowWorkspace.Has(hwnd)
+                restoredWindows += 1
+            WindowWorkspace[hwnd] := {monitor: monitor, workspace: home.workspace}
+            if home.placement
+                RestoreWindowPlacement(hwnd, home.placement, home.monitor,
+                    MonitorTopology, monitor)
+            if !home.shown && !IsVisible(hwnd)
+                RestoredSelfHiddenWindows[hwnd] := true
+            DebugLog("STATE_WINDOW_RETURN", "monitor=" monitor " workspace=D" home.workspace
+                " " DebugDescribeWindow(hwnd))
+            continue
+        }
+        DisplacedWindows[hwnd] := home
+        ; The engine that saved it revealed it as it stopped. It waits hidden
+        ; again, unless it was a guest on another monitor's workspace.
+        if home.shown && !WindowWorkspace.Has(hwnd) {
+            if IsVisible(hwnd)
+                HideWindowFast(hwnd)
+            HiddenByScript[hwnd] := true
+        }
+        DebugLog("STATE_WINDOW_WAIT", "home=" home.device " workspace=D" home.workspace
+            " " DebugDescribeWindow(hwnd))
+    }
+
     ; Release popups and overlays saved by older versions. Checked once every
     ; window is loaded, since a palette counts only while its owner is tracked.
     ; They are left as they are: showing one could bring back a finished popup.
@@ -4164,7 +4893,7 @@ LoadWorkspaceState() {
 
     DebugLog("STATE_LOAD", "result=ok monitors=" restoredMonitors
         " windows=" restoredWindows " rejected=" rejectedWindows
-        " orderEntries=" restoredOrderEntries
+        " orderEntries=" restoredOrderEntries " waiting=" DisplacedWindows.Count
         " path=" WORKSPACE_STATE_PATH)
     return restoredMonitors || restoredWindows
 }
@@ -4338,6 +5067,10 @@ DebugWorkspaceSummary(monitor) {
 
 VerifyWorkspaceTransition(monitor, workspace, attempt := 0) {
     global CurrentWorkspace, WindowWorkspace, HiddenByScript, Switching
+    global DisplayTopologyPending
+    ; Scheduled before a display change, its monitor number may be stale.
+    if DisplayTopologyPending
+        return
     mismatchCount := 0
     mismatchDetails := ""
     released := 0

@@ -17,7 +17,7 @@ Windows virtual desktops switch every display together. This lightweight AutoHot
 - Native cursor-to-monitor detection across mixed DPI and scaling
 - Automatic support for one, two, three, four, or more connected monitors
 - Mission Control-style workspace overview with window previews
-- Safe reset when displays are connected, disconnected, docked, or rearranged
+- Remembers every window when a display disconnects, such as a monitor switched to a game console, and puts each one back on the same monitor, in the same spot and workspace, when it returns
 - No background service, driver, scheduled task, registry edit, telemetry, or administrator requirement
 
 ## Install in one command
@@ -81,6 +81,16 @@ When an app closes and reopens within ten minutes on the same monitor, the utili
 
 Restart memory lasts for the current workspace-engine session and also applies to a manual close and reopen. It covers an app's top-level windows; its dialogs and popups always open on the workspace you are using. Each closed window allows one replacement. Apps whose matching windows belong to different workspaces, reopen on another monitor, or change their executable path or window class beyond the supported version-folder patterns use normal placement. Resetting workspaces clears restart memory.
 
+## Disconnecting and reconnecting monitors
+
+Switching a monitor's input to a game console, unplugging it, or letting it drop off the cable while it sleeps disconnects it from Windows, often for only a second. The utility remembers that monitor's workspaces and puts everything back when it returns.
+
+- Windows moves the apps on the monitor's visible workspace onto your other monitors. Each one joins the workspace shown where it landed, so it hides and reappears with that workspace while the monitor is away.
+- Apps on the monitor's other workspaces stay hidden and wait for it.
+- When the monitor returns, every app goes back to the same monitor, position, size, and maximized or minimized state, in the same D-number, and the monitor shows the workspace it was showing before. Apps on the other monitors keep their workspaces throughout.
+
+A monitor that blinks off and back on, as many do while switching inputs, gets the same treatment, and windows Windows moved during the blink are put back. If a monitor returns at a different position or resolution, its apps keep their place relative to it and are fitted onto it. This memory survives workspace-engine restarts while the monitor is away. An app that shows a waiting window by itself keeps it on screen, in the workspace shown where it appears, until its monitor returns. `Win+Ctrl+Shift+Esc` reveals every waiting window on your main monitor and forgets the disconnected monitor.
+
 ## Workspace overview
 
 Press `Win+Ctrl+Space`, or hold the pointer in a monitor's top-left corner for half a second, to see every workspace on that monitor. The active workspace uses live window thumbnails. Inactive workspaces use snapshots captured immediately before their windows were hidden. A window hidden since before the engine started shows a placeholder until its workspace is next shown.
@@ -97,7 +107,7 @@ Preview capture is best effort. Protected, elevated, or specialized application 
 
 The app records workspace switching diagnostics in `%LOCALAPPDATA%\IndependentMonitorWorkspaces\debug.log`. Right-click its tray icon and select **Open debug log** to inspect or share it. The log includes window titles and process names so workspace assignments and focus failures can be identified. It rotates to `debug.previous.log` at 4 MB.
 
-Workspace assignments, each monitor's active D-number, each workspace's window stack, and which windows their own apps had hidden are saved in `%LOCALAPPDATA%\IndependentMonitorWorkspacesState\workspace-state.tsv`. This state survives workspace-engine updates and restarts; stale windows are rejected by matching both their window handle and process ID. The short-term memory for other apps' replacement windows is kept separately in memory.
+Workspace assignments, each monitor's active D-number, each workspace's window stack, which windows their own apps had hidden, and the windows and active D-number of disconnected monitors are saved in `%LOCALAPPDATA%\IndependentMonitorWorkspacesState\workspace-state.tsv`. This state survives workspace-engine updates and restarts; stale windows are rejected by matching both their window handle and process ID. The short-term memory for other apps' replacement windows is kept separately in memory.
 
 ## Uninstall in one command
 
@@ -129,7 +139,7 @@ Windows exposes one active native virtual desktop across the full display topolo
 
 Monitor targeting uses the native Windows `HMONITOR` device under the physical cursor instead of comparing logical screen coordinates. The entire engine runs per-monitor-v2 DPI-aware, keeping monitor bounds, captures, buffers, and animation windows in one physical-pixel coordinate space. This avoids wrong-monitor selection and rendering rescale artifacts on displays with different scaling factors.
 
-Display count is dynamic. One monitor works like a normal workspace switcher; additional monitors receive independent state automatically. A Windows display-topology notification triggers a safe reveal-and-reset after docking, unplugging, rearranging, or resolution changes.
+Display count is dynamic. One monitor works like a normal workspace switcher; additional monitors receive independent state automatically. Workspaces belong to each monitor's `\\.\DISPLAYn` device rather than its position in Windows' monitor list, which reorders as displays come and go. The engine checks the monitor list with every 250 ms window scan and listens for Windows' display-change notification. While displays change, it learns nothing from windows Windows is moving between monitors and holds workspace switches. It waits 1.5 seconds for the change to settle, then carries every workspace to its monitor's new number. Window positions recorded during the last scan before the change are used to put back windows that Windows moved.
 
 ## Compatibility and requirements
 

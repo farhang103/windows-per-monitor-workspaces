@@ -36,6 +36,8 @@ DetectHiddenWindows true
 SetWinDelay -1
 OnMessage(0x000F, PaintWorkspaceOverview)
 OnMessage(0x0014, HandleWorkspaceSlideEraseBackground)
+; The engine records the monitor layout at startup.
+SetMonitorTopology(ReadMonitorTopology())
 try {
     TestHungWindowSwitch()
     FileAppend("Hung window tests passed (switch away and back, snapshots, stack restore, raise, verify).`n", "*")
